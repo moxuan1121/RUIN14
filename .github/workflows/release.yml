@@ -55,6 +55,21 @@ jobs:
           RUIN_VERSION: ${{ steps.version.outputs.value }}
         run: make dist RUIN_BUILD_VERSION="$RUIN_VERSION"
 
+      - name: Prepare and verify LiveContainer release dylib
+        env:
+          RUIN_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          lc_dylib="dist/RUIN-${RUIN_VERSION}-LiveContainer.dylib"
+          prepared="build/RUIN-${RUIN_VERSION}-LiveContainer.prepared.dylib"
+          rm -f "$prepared"
+          python3 tools/prepare_livecontainer.py "$lc_dylib" "$prepared"
+          cmp -s "$lc_dylib" "$prepared"
+          rm -f "$prepared"
+          python3 -c 'import sys; sys.path.insert(0, "tools"); from distribute import verify_dylib; verify_dylib(sys.argv[1], for_livecontainer=True)' "$lc_dylib"
+          python3 tools/verify_embedded_resources.py "$lc_dylib"
+          (cd dist && shasum -a 256 -c SHA256SUMS)
+
       - name: Upload rootful artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

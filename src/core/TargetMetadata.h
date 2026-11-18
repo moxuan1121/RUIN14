@@ -1,6 +1,9 @@
 #pragma once
 #import "../known/BinaryVerifier.h"
 #import "../known/VersionMapping.h"
+#import <objc/runtime.h>
+#include <stdlib.h>
+#include <string.h>
 
 static inline BOOL RUINVersionMetadataIsValid(id value) {
     if (![value isKindOfClass:NSString.class]) return NO;
@@ -50,4 +53,16 @@ static inline BOOL RUINVerifiedTargetMatchesInfo(NSDictionary *info) {
 static inline BOOL RUINFullySupportedTargetMatchesInfo(NSDictionary *info) {
     const RUINVersionMapping *mapping = RUINVerifiedMappingForInfo(info);
     return mapping && mapping->host.supportStatus == RUINMappingStatusVerified;
+}
+
+static inline BOOL RUINClassBelongsToBundleExecutable(Class cls) {
+    const char *owner = cls ? class_getImageName(cls) : NULL;
+    const char *executable = NSBundle.mainBundle.executablePath.fileSystemRepresentation;
+    if (!owner || !*owner || !executable || !*executable) return NO;
+    char *ownerPath = realpath(owner, NULL);
+    char *executablePath = realpath(executable, NULL);
+    BOOL matches = ownerPath && executablePath && !strcmp(ownerPath, executablePath);
+    free(ownerPath);
+    free(executablePath);
+    return matches;
 }

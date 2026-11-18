@@ -133,7 +133,23 @@ static NSArray<NSDictionary *> *ToggleRows(NSInteger section) {
         default: return @[];
     }
 }
+static void RUINApplySystemNavigationBarAppearance(UIViewController *controller) {
+    UITraitCollection *traits = controller.viewIfLoaded ? controller.viewIfLoaded.traitCollection : controller.traitCollection;
+    UIColor *labelColor = [UIColor.labelColor resolvedColorWithTraitCollection:traits];
+    UINavigationBarAppearance *appearance = [UINavigationBarAppearance new];
+    [appearance configureWithDefaultBackground];
+    appearance.titleTextAttributes = @{NSForegroundColorAttributeName: labelColor};
+    appearance.largeTitleTextAttributes = @{NSForegroundColorAttributeName: labelColor};
+    controller.navigationItem.standardAppearance = appearance;
+    controller.navigationItem.scrollEdgeAppearance = appearance;
+    controller.navigationItem.compactAppearance = appearance;
+}
+
 @implementation RUINSettingsViewController
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    RUINApplySystemNavigationBarAppearance(self);
+}
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
     [self.tableView reloadData];
@@ -148,6 +164,7 @@ static NSArray<NSDictionary *> *ToggleRows(NSInteger section) {
 }
 - (void)viewDidLoad {
     [super viewDidLoad]; self.title = RUINLocalizedString(@"settings.title");
+    RUINApplySystemNavigationBarAppearance(self);
     self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeAlways;
     if (self.navigationController.viewControllers.firstObject == self)
         self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemClose target:self action:@selector(closeSettings)];
@@ -211,69 +228,118 @@ static NSArray<NSDictionary *> *ToggleRows(NSInteger section) {
     if (section == RUINSettingsSectionLineFeatures) return ToggleRows(RUINSettingsSectionLineFeatures).count + 1;
     return MAX((NSInteger)1, (NSInteger)ToggleRows(section).count);
 }
-- (UITableViewCell *)tableView:(__unused UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)path {
-    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
-    cell.textLabel.numberOfLines = 0; cell.detailTextLabel.numberOfLines = 2;
-    NSArray *rows = ToggleRows(path.section);
-    if (self.compatible && path.section == RUINSettingsSectionLinks) {
-        NSDictionary *link = RUINCommunityLinks()[path.row];
-        cell.textLabel.text = link[@"title"];
-        cell.detailTextLabel.text = link[@"detail"];
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-    } else if (!self.compatible || path.section == RUINSettingsSectionDiagnostics) {
-        cell.textLabel.text = path.row == 0 ? RUINLocalizedString(@"diagnostics.runtime_title") : RUINLocalizedString(@"diagnostics.feature_matrix");
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-    } else if (path.section == RUINSettingsSectionLineFeatures && (NSUInteger)path.row == ToggleRows(RUINSettingsSectionLineFeatures).count) {
-        cell.textLabel.text = RUINLocalizedString(@"font.title");
-        cell.detailTextLabel.text = RUINLocalFontName() ?: RUINLocalizedString(@"font.default");
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-    } else if (path.section == RUINSettingsSectionMIDLookup) {
-        cell.textLabel.text = RUINLocalizedString(@"profile.open_by_mid");
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-    } else if (path.section == RUINSettingsSectionShops) {
-        cell.textLabel.text = path.row == 0 ? RUINLocalizedString(@"themes.downloads_title") : RUINLocalizedString(@"shops.sticker_title");
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-    } else if (path.section == RUINSettingsSectionVersion && path.row == 1 && !self.fullySupported) {
-        cell.textLabel.text = RUINLocalizedString(@"compatibility.partial.title");
-        cell.detailTextLabel.text = RUINPartialCompatibilityMessage();
-        cell.textLabel.textColor = UIColor.systemOrangeColor;
-        cell.selectionStyle = UITableViewCellSelectionStyleNone;
-    } else if (path.section == RUINSettingsSectionVersion) {
-        cell.textLabel.text = [NSString stringWithFormat:@"RUIN v%@", RUINVersion];
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"LINE %@ / %@", RUINSettingsInfoString(@"CFBundleShortVersionString"), RUINSettingsInfoString(@"CFBundleVersion")];
-        cell.selectionStyle = UITableViewCellSelectionStyleNone;
-    } else if (path.section == RUINSettingsSectionLocalNames) {
-        cell.textLabel.text = RUINLocalizedString(@"names.choose_chat");
-        cell.detailTextLabel.text = [NSString stringWithFormat:RUINLocalizedString(@"names.modified_chat_count"), (unsigned long)self.aliases.count];
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-    } else if (path.section == RUINSettingsSectionSecondaryLogin) {
-        BOOL on = [RUINSecondaryLoginDiagnostics()[@"activeTabletRole"] boolValue];
-        cell.textLabel.text = on ? RUINLocalizedString(@"login.secondary_mode") : RUINLocalizedString(@"login.primary_mode");
-        cell.selectionStyle = UITableViewCellSelectionStyleNone;
-    } else if ((NSUInteger)path.row < rows.count) {
-        NSDictionary *row = rows[path.row]; NSString *key = row[@"key"];
-        cell.textLabel.text = row[@"title"];
-        RUINPreferenceSwitch *toggle = [RUINPreferenceSwitch new];
-        toggle.preferenceKey = key;
-        toggle.on = [NSUserDefaults.standardUserDefaults boolForKey:key];
-        toggle.accessibilityLabel = row[@"title"];
-        if (path.section == RUINSettingsSectionTabs) toggle.enabled = toggle.on ||
-            ([key isEqual:RUINLegacyHomeEnabledDefaultsKey] ? RUINLegacyHomeAvailable() : RUINCanHideNativeService(key));
-        if ([key isEqual:RUINHideSettingsTabDefaultsKey]) toggle.enabled = toggle.on ||
+- (void)configureToggleCell:(UITableViewCell *)cell row:(NSDictionary *)row section:(NSInteger)section {
+    NSString *key = row[@"key"];
+    cell.textLabel.text = row[@"title"];
+    RUINPreferenceSwitch *toggle = [RUINPreferenceSwitch new];
+    toggle.preferenceKey = key;
+    toggle.on = [NSUserDefaults.standardUserDefaults boolForKey:key];
+    toggle.accessibilityLabel = row[@"title"];
+    if (section == RUINSettingsSectionTabs) {
+        toggle.enabled = toggle.on || ([key isEqual:RUINLegacyHomeEnabledDefaultsKey]
+            ? RUINLegacyHomeAvailable() : RUINCanHideNativeService(key));
+    }
+    if ([key isEqual:RUINHideSettingsTabDefaultsKey]) {
+        toggle.enabled = toggle.on ||
             (toggle.enabled && [RUINNativeEntryDiagnostics()[@"homeEntryAvailable"] boolValue]);
-        cell.textLabel.textColor = toggle.enabled ? UIColor.labelColor : UIColor.secondaryLabelColor;
-        [toggle addTarget:self action:@selector(preferenceChanged:) forControlEvents:UIControlEventValueChanged];
-        cell.accessoryView = toggle; cell.selectionStyle = UITableViewCellSelectionStyleNone;
-    } else {
-        if (path.section == RUINSettingsSectionReadControls) { cell.textLabel.text = RUINLocalizedString(@"settings.read_exceptions"); cell.detailTextLabel.text = [NSString stringWithFormat:RUINLocalizedString(@"common.item_count"), (unsigned long)[NSUserDefaults.standardUserDefaults arrayForKey:RUINReadExceptionsDefaultsKey].count]; }
-        if (path.section == RUINSettingsSectionConfirmations) { cell.textLabel.text = RUINLocalizedString(@"settings.minimum_group_members"); cell.detailTextLabel.text = [NSString stringWithFormat:RUINLocalizedString(@"common.member_count"), (long)[NSUserDefaults.standardUserDefaults integerForKey:RUINConfirmSendMinimumGroupMemberCountDefaultsKey]]; }
-        if (path.section == RUINSettingsSectionTabs) {
+    }
+    cell.textLabel.textColor = toggle.enabled ? UIColor.labelColor : UIColor.secondaryLabelColor;
+    [toggle addTarget:self action:@selector(preferenceChanged:) forControlEvents:UIControlEventValueChanged];
+    cell.accessoryView = toggle;
+    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+}
+- (void)configureActionRowCell:(UITableViewCell *)cell section:(NSInteger)section {
+    switch (section) {
+        case RUINSettingsSectionReadControls:
+            cell.textLabel.text = RUINLocalizedString(@"settings.read_exceptions");
+            cell.detailTextLabel.text = [NSString stringWithFormat:RUINLocalizedString(@"common.item_count"),
+                (unsigned long)[NSUserDefaults.standardUserDefaults arrayForKey:RUINReadExceptionsDefaultsKey].count];
+            break;
+        case RUINSettingsSectionConfirmations:
+            cell.textLabel.text = RUINLocalizedString(@"settings.minimum_group_members");
+            cell.detailTextLabel.text = [NSString stringWithFormat:RUINLocalizedString(@"common.member_count"),
+                (long)[NSUserDefaults.standardUserDefaults integerForKey:RUINConfirmSendMinimumGroupMemberCountDefaultsKey]];
+            break;
+        case RUINSettingsSectionTabs: {
             cell.textLabel.text = RUINLocalizedString(@"settings.startup_tab");
             NSString *identifier = [NSUserDefaults.standardUserDefaults stringForKey:RUINStartupTabDefaultsKey];
             cell.detailTextLabel.text = RUINTabTitles()[identifier ?: @""] ?: RUINLocalizedString(@"common.not_set");
+            break;
         }
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        case RUINSettingsSectionLineFeatures:
+            cell.textLabel.text = RUINLocalizedString(@"font.title");
+            cell.detailTextLabel.text = RUINLocalFontName() ?: RUINLocalizedString(@"font.default");
+            break;
+        default: break;
     }
+    cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+}
+- (void)configureStaticCell:(UITableViewCell *)cell atIndexPath:(NSIndexPath *)path {
+    switch (path.section) {
+        case RUINSettingsSectionVersion:
+            if (path.row == 1 && !self.fullySupported) {
+                cell.textLabel.text = RUINLocalizedString(@"compatibility.partial.title");
+                cell.detailTextLabel.text = RUINPartialCompatibilityMessage();
+                cell.textLabel.textColor = UIColor.systemOrangeColor;
+            } else {
+                cell.textLabel.text = [NSString stringWithFormat:@"RUIN v%@", RUINVersion];
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"LINE %@ / %@",
+                    RUINSettingsInfoString(@"CFBundleShortVersionString"), RUINSettingsInfoString(@"CFBundleVersion")];
+            }
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            return;
+        case RUINSettingsSectionLocalNames:
+            cell.textLabel.text = RUINLocalizedString(@"names.choose_chat");
+            cell.detailTextLabel.text = [NSString stringWithFormat:RUINLocalizedString(@"names.modified_chat_count"),
+                (unsigned long)self.aliases.count];
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            return;
+        case RUINSettingsSectionSecondaryLogin: {
+            BOOL on = [RUINSecondaryLoginDiagnostics()[@"activeTabletRole"] boolValue];
+            cell.textLabel.text = on ? RUINLocalizedString(@"login.secondary_mode") : RUINLocalizedString(@"login.primary_mode");
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            return;
+        }
+        case RUINSettingsSectionDiagnostics:
+            cell.textLabel.text = path.row == 0
+                ? RUINLocalizedString(@"diagnostics.runtime_title")
+                : RUINLocalizedString(@"diagnostics.feature_matrix");
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            return;
+        case RUINSettingsSectionShops:
+            cell.textLabel.text = path.row == 0
+                ? RUINLocalizedString(@"themes.downloads_title")
+                : RUINLocalizedString(@"shops.sticker_title");
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            return;
+        case RUINSettingsSectionMIDLookup:
+            cell.textLabel.text = RUINLocalizedString(@"profile.open_by_mid");
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            return;
+        case RUINSettingsSectionLinks: {
+            NSDictionary *link = RUINCommunityLinks()[path.row];
+            cell.textLabel.text = link[@"title"];
+            cell.detailTextLabel.text = link[@"detail"];
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            return;
+        }
+        default: return;
+    }
+}
+- (UITableViewCell *)tableView:(__unused UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)path {
+    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+    cell.textLabel.numberOfLines = 0; cell.detailTextLabel.numberOfLines = 2;
+    if (!self.compatible) {
+        [self configureStaticCell:cell atIndexPath:[NSIndexPath indexPathForRow:path.row inSection:RUINSettingsSectionDiagnostics]];
+        return cell;
+    }
+    NSArray *rows = ToggleRows(path.section);
+    if (rows.count > 0) {
+        if ((NSUInteger)path.row < rows.count) [self configureToggleCell:cell row:rows[path.row] section:path.section];
+        else [self configureActionRowCell:cell section:path.section];
+        return cell;
+    }
+    [self configureStaticCell:cell atIndexPath:path];
     return cell;
 }
 - (void)preferenceChanged:(RUINPreferenceSwitch *)toggle {
@@ -297,6 +363,9 @@ static NSArray<NSDictionary *> *ToggleRows(NSInteger section) {
         RUINDiagnosticsViewController *viewer = [RUINDiagnosticsViewController new];
         if (path.row == 1) {
             viewer.document = RUINFeatureDiagnostics();
+            viewer.title = RUINLocalizedString(@"diagnostics.feature_matrix");
+        } else {
+            viewer.title = RUINLocalizedString(@"diagnostics.runtime_title");
         }
         [self.navigationController pushViewController:viewer animated:YES];
     } else if (path.section == RUINSettingsSectionLineFeatures && (NSUInteger)path.row == ToggleRows(RUINSettingsSectionLineFeatures).count) {
@@ -342,11 +411,21 @@ static NSArray<NSDictionary *> *ToggleRows(NSInteger section) {
 }
 @end
 
+@interface RUINDiagnosticsViewController ()
+@property(nonatomic, copy) NSString *reportText;
+@end
+
 @implementation RUINDiagnosticsViewController
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    RUINApplySystemNavigationBarAppearance(self);
+}
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = RUINLocalizedString(@"settings.diagnostics");
+    if (!self.title.length) self.title = RUINLocalizedString(@"settings.diagnostics");
+    RUINApplySystemNavigationBarAppearance(self);
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     UITextView *textView = [UITextView new];
     textView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -360,8 +439,15 @@ static NSArray<NSDictionary *> *ToggleRows(NSInteger section) {
     NSData *json = [NSJSONSerialization dataWithJSONObject:(self.document ?: RUINRuntimeDiagnostics())
                                                    options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys
                                                      error:&error];
-    textView.text = json ? [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding]
-                        : [NSString stringWithFormat:RUINLocalizedString(@"diagnostics.json_failed"), error.localizedDescription ?: RUINLocalizedString(@"errors.unknown")];
+    self.reportText = json ? [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding]
+                           : [NSString stringWithFormat:RUINLocalizedString(@"diagnostics.json_failed"), error.localizedDescription ?: RUINLocalizedString(@"errors.unknown")];
+    textView.text = self.reportText;
+    if (json && self.reportText.length) {
+        self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc]
+            initWithBarButtonSystemItem:UIBarButtonSystemItemAction
+                                 target:self
+                                 action:@selector(shareDiagnostics:)];
+    }
     [self.view addSubview:textView];
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
@@ -372,6 +458,16 @@ static NSArray<NSDictionary *> *ToggleRows(NSInteger section) {
     ]];
 }
 
+- (void)shareDiagnostics:(UIBarButtonItem *)sender {
+    if (!self.reportText.length) return;
+    UIActivityViewController *activity = [[UIActivityViewController alloc]
+        initWithActivityItems:@[self.reportText]
+        applicationActivities:nil];
+    if (activity.popoverPresentationController) {
+        activity.popoverPresentationController.barButtonItem = sender;
+    }
+    [self presentViewController:activity animated:YES completion:nil];
+}
 
 @end
 

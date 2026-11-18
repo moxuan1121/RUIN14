@@ -75,10 +75,23 @@ BOOL RUINFeatureImageMatches(const RUINFeatureImage *image, const RUINHostIdenti
         header.cputype == image->image.cpuType && header.cpusubtype == image->image.cpuSubtype;
 }
 
+static char *CanonicalPath(const char *path) {
+    return path && *path ? realpath(path, NULL) : NULL;
+}
+
+static BOOL MatchesCanonicalPath(const char *raw, const char *canonical, const char *candidate) {
+    if (!canonical || !candidate || !*candidate) return NO;
+    if ((raw && !strcmp(raw, candidate)) || !strcmp(canonical, candidate)) return YES;
+    char *resolved = CanonicalPath(candidate);
+    BOOL matches = resolved && !strcmp(canonical, resolved);
+    free(resolved);
+    return matches;
+}
+
 static BOOL SamePath(const char *left, const char *right) {
-    char *a = left ? realpath(left, NULL) : NULL, *b = right ? realpath(right, NULL) : NULL;
-    BOOL same = a && b && !strcmp(a, b);
-    free(a); free(b);
+    char *canonical = CanonicalPath(left);
+    BOOL same = MatchesCanonicalPath(left, canonical, right);
+    free(canonical);
     return same;
 }
 
@@ -116,12 +129,16 @@ BOOL RUINResolveFeatureImageFromCandidates(const RUINHostIdentity *host,
     size_t count, RUINFeatureImage *result) {
     if (!result) return NO;
     memset(result, 0, sizeof(*result));
-    if (!host || !ownerHeader || !SamePath(bundleExecutable, ownerExecutable) ||
-        (!candidates && count) || count > UINT32_MAX) return NO;
-    BOOL found = NO, sameProcessPath = SamePath(bundleExecutable, processExecutable);
+    char *canonicalBundle = CanonicalPath(bundleExecutable);
+    if (!host || !ownerHeader || !MatchesCanonicalPath(bundleExecutable, canonicalBundle, ownerExecutable) ||
+        (!candidates && count) || count > UINT32_MAX) {
+        free(canonicalBundle);
+        return NO;
+    }
+    BOOL found = NO, sameProcessPath = MatchesCanonicalPath(bundleExecutable, canonicalBundle, processExecutable);
     for (size_t i = 0; i < count; i++) {
         const RUINDyldImageCandidate *candidate = &candidates[i];
-        if (!SamePath(bundleExecutable, candidate->imageName)) continue;
+        if (!MatchesCanonicalPath(bundleExecutable, canonicalBundle, candidate->imageName)) continue;
         struct mach_header_64 header; uint8_t uuid[16]; BOOL converted = NO;
         NSData *commands = CopyCommands(candidate->header, &header, uuid, &converted);
         if (candidate->header != ownerHeader || !commands ||
@@ -143,8 +160,12 @@ BOOL RUINResolveFeatureImageFromCandidates(const RUINHostIdentity *host,
         if (!RUINFeatureImageMatches(result, host)) goto reject;
         found = YES;
     }
-    if (found) return YES;
+    if (found) {
+        free(canonicalBundle);
+        return YES;
+    }
 reject:
+    free(canonicalBundle);
     memset(result, 0, sizeof(*result));
     return NO;
 }
@@ -260,13 +281,16 @@ BOOL RUINResolveFeatureImage(const RUINHostIdentity *host, Class nativeClass,
     RUINDyldImageCandidate *candidates = count ? calloc(count, sizeof(*candidates)) : NULL;
     BOOL complete = process && candidates;
     const struct mach_header_64 *ownerHeader = NULL;
+    char *canonicalOwner = CanonicalPath(ownerPath);
     for (uint32_t i = 0; complete && i < count; i++) {
         candidates[i] = (RUINDyldImageCandidate){
             .header=(const void *)_dyld_get_image_header(i), .slide=_dyld_get_image_vmaddr_slide(i),
             .imageName=CopyImageName(_dyld_get_image_name(i))};
         if (!candidates[i].imageName) complete = NO;
-        else if (!ownerHeader && SamePath(ownerPath, candidates[i].imageName)) ownerHeader = candidates[i].header;
+        else if (!ownerHeader && MatchesCanonicalPath(ownerPath, canonicalOwner, candidates[i].imageName))
+            ownerHeader = candidates[i].header;
     }
+    free(canonicalOwner);
     BOOL resolved = complete && count == _dyld_image_count() &&
         generation == atomic_load_explicit(&imageGeneration, memory_order_acquire) &&
         RUINResolveFeatureImageFromCandidates(host, bundle, process, ownerPath,

@@ -231,7 +231,90 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     assert(secondaryScope.length == 64 && ![secondaryScope isEqual:scope]);
     assert(BadgeCorrection(context, secondary, account, markers) == 0);
     assert(BadgeCorrection(context, secondary, account, @{secondaryScope:@104}) == 2 && !context.hasChanges);
-    puts("PASS unread snapshots: restored history delta, legacy persistence, cursor/deletion/missing-tail safety and zero native writes");
+
+    // Re-homing the identical Line.sqlite under a new sandbox container UUID preserves BadgeScope.
+    NSString *rehomedPath = [root stringByAppendingPathComponent:[NSString stringWithFormat:@"rehomed-container/PrivateStore/P_%@/Messages/Line.sqlite", account]];
+    [NSFileManager.defaultManager createDirectoryAtPath:rehomedPath.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:NULL];
+    for (NSString *suffix in @[@"", @"-wal", @"-shm"]) {
+        NSString *src = [path stringByAppendingString:suffix];
+        if ([NSFileManager.defaultManager fileExistsAtPath:src]) {
+            assert([NSFileManager.defaultManager copyItemAtPath:src toPath:[rehomedPath stringByAppendingString:suffix] error:NULL]);
+        }
+    }
+    NSPersistentStoreCoordinator *rehomedCoord = [[NSPersistentStoreCoordinator alloc] initWithManagedObjectModel:model];
+    NSPersistentStore *rehomedStore = [rehomedCoord addPersistentStoreWithType:NSSQLiteStoreType configuration:nil URL:[NSURL fileURLWithPath:rehomedPath] options:nil error:NULL];
+    assert(rehomedStore);
+    NSManagedObjectContext *rehomedContext = [[NSManagedObjectContext alloc] initWithConcurrencyType:NSMainQueueConcurrencyType];
+    rehomedContext.persistentStoreCoordinator = rehomedCoord;
+    NSManagedObject *rehomedChat = [rehomedContext existingObjectWithID:[rehomedCoord managedObjectIDForURIRepresentation:chat.objectID.URIRepresentation] error:NULL];
+    assert(rehomedChat && [[BadgeScope(rehomedChat, account) copy] isEqual:scope]);
+
+    // Exercise LINE's real NSString Message.id schema (Snowflake IDs + 17-digit history + width crossings).
+    NSEntityDescription *sChatEntity = [NSEntityDescription new]; sChatEntity.name = @"Chat";
+    sChatEntity.managedObjectClassName = @"ManagedChat";
+    sChatEntity.properties = @[Attribute(@"unread", NSInteger32AttributeType), Attribute(@"enable", NSBooleanAttributeType), Attribute(@"type", NSInteger16AttributeType),
+        Attribute(@"lastReceivedMessageID", NSInteger64AttributeType), Attribute(@"readUpToMessageID", NSInteger64AttributeType)];
+    NSEntityDescription *sMsgEntity = [NSEntityDescription new]; sMsgEntity.name = @"Message";
+    sMsgEntity.managedObjectClassName = @"ManagedMessage";
+    NSRelationshipDescription *sRel = [NSRelationshipDescription new]; sRel.name = @"chat";
+    sRel.destinationEntity = sChatEntity; sRel.minCount = 0; sRel.maxCount = 1;
+    NSAttributeDescription *strIDAttr = [NSAttributeDescription new];
+    strIDAttr.name = @"id"; strIDAttr.attributeType = NSStringAttributeType; strIDAttr.optional = NO; strIDAttr.defaultValue = @"";
+    sMsgEntity.properties = @[strIDAttr, Attribute(@"timestamp", NSInteger64AttributeType),
+        Attribute(@"eligible", NSBooleanAttributeType), Attribute(@"received", NSBooleanAttributeType),
+        Attribute(@"outgoing", NSBooleanAttributeType), sRel];
+    NSManagedObjectModel *sModel = [NSManagedObjectModel new]; sModel.entities = @[sChatEntity, sMsgEntity];
+    NSPersistentStoreCoordinator *sCoord = [[NSPersistentStoreCoordinator alloc] initWithManagedObjectModel:sModel];
+    NSString *sPath = [root stringByAppendingPathComponent:[NSString stringWithFormat:@"string-ids/PrivateStore/P_%@/Messages/Line.sqlite", account]];
+    [NSFileManager.defaultManager createDirectoryAtPath:sPath.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:NULL];
+    NSPersistentStore *sStore = [sCoord addPersistentStoreWithType:NSSQLiteStoreType configuration:nil URL:[NSURL fileURLWithPath:sPath] options:nil error:NULL];
+    assert(sStore);
+    NSManagedObjectContext *sCtx = [[NSManagedObjectContext alloc] initWithConcurrencyType:NSMainQueueConcurrencyType];
+    sCtx.persistentStoreCoordinator = sCoord;
+    void (^addStrMsg)(NSManagedObject *, NSString *, BOOL, BOOL, BOOL) = ^(NSManagedObject *target, NSString *msgID, BOOL elig, BOOL recv, BOOL out) {
+        NSManagedObject *m = [NSEntityDescription insertNewObjectForEntityForName:@"Message" inManagedObjectContext:sCtx];
+        [m setValue:msgID forKey:@"id"]; [m setValue:target forKey:@"chat"];
+        [m setValue:@(elig) forKey:@"eligible"]; [m setValue:@(recv) forKey:@"received"]; [m setValue:@(out) forKey:@"outgoing"];
+    };
+    NSManagedObject *sChat = [NSEntityDescription insertNewObjectForEntityForName:@"Chat" inManagedObjectContext:sCtx];
+    [sChat setValue:@YES forKey:@"enable"]; [sChat setValue:@3 forKey:@"unread"];
+    [sChat setValue:@(640900709466243212LL) forKey:@"lastReceivedMessageID"]; [sChat setValue:@0 forKey:@"readUpToMessageID"];
+    // 1050 historical 17-digit rows falling lexicographically in 6400..6409 must not break the 18-digit tail query.
+    for (int i = 1; i <= 1050; i++) addStrMsg(sChat, [NSString stringWithFormat:@"640500000000%05d", i], YES, YES, NO);
+    addStrMsg(sChat, @"-1", YES, YES, NO);
+    addStrMsg(sChat, @"local-temp", YES, YES, NO);
+    addStrMsg(sChat, @"0640900709466243215", YES, YES, NO);
+    addStrMsg(sChat, @"640900709466243210", YES, YES, NO);
+    addStrMsg(sChat, @"640900709466243211", YES, YES, NO);
+    addStrMsg(sChat, @"640900709466243212", YES, YES, NO);
+    assert([sCtx save:NULL]);
+    NSDictionary *sViewed = ViewedSnapshot(sChat);
+    assert(ValidViewedMarker(sViewed));
+    assert(BadgeCount(sChat, sViewed) == 0);
+    assert([BadgeCountDiagnostics()[@"reason"] isEqual:@"viewed_boundary_unchanged"] &&
+           [BadgeCountDiagnostics()[@"viewedUnread"] integerValue] == 3);
+    addStrMsg(sChat, @"640900709466243213", YES, YES, NO);
+    addStrMsg(sChat, @"temp-outgoing", YES, NO, YES);
+    [sChat setValue:@4 forKey:@"unread"]; [sChat setValue:@(640900709466243213LL) forKey:@"lastReceivedMessageID"];
+    assert([sCtx save:NULL]);
+    assert(BadgeCount(sChat, sViewed) == 1);
+    assert([BadgeCountDiagnostics()[@"reason"] isEqual:@"snapshot_delta"] &&
+           [BadgeCountDiagnostics()[@"eligibleNewTail"] integerValue] == 1 &&
+           [BadgeCountDiagnostics()[@"viewedUnread"] integerValue] == 3);
+    assert(BadgeCorrection(sCtx, sStore, account, @{BadgeScope(sChat, account):sViewed}) == 3);
+
+    // Small-chat digit-width crossing ("98" -> "103").
+    NSManagedObject *wChat = [NSEntityDescription insertNewObjectForEntityForName:@"Chat" inManagedObjectContext:sCtx];
+    [wChat setValue:@YES forKey:@"enable"]; [wChat setValue:@2 forKey:@"unread"];
+    [wChat setValue:@99 forKey:@"lastReceivedMessageID"]; [wChat setValue:@0 forKey:@"readUpToMessageID"];
+    addStrMsg(wChat, @"98", YES, YES, NO); addStrMsg(wChat, @"99", YES, YES, NO);
+    assert([sCtx save:NULL]);
+    NSDictionary *wViewed = ViewedSnapshot(wChat);
+    addStrMsg(wChat, @"100", YES, YES, NO); addStrMsg(wChat, @"101", NO, YES, NO); addStrMsg(wChat, @"103", YES, YES, NO);
+    [wChat setValue:@4 forKey:@"unread"]; [wChat setValue:@103 forKey:@"lastReceivedMessageID"];
+    assert([sCtx save:NULL] && BadgeCount(wChat, wViewed) == 2 && !sCtx.hasChanges);
+
+    puts("PASS unread snapshots: restored history delta, NSString Snowflake IDs + 17-digit history, width crossings, legacy persistence and zero native writes");
 } return 0; }
 '''
 

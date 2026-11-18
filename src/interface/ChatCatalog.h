@@ -2,8 +2,10 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+FOUNDATION_EXPORT NSNotificationName const RUINChatCatalogDidCaptureTalkContextNotification;
 FOUNDATION_EXPORT void RUINInstallChatCatalog(void);
 FOUNDATION_EXPORT NSString *RUINChatCatalogAccount(void);
+FOUNDATION_EXPORT id _Nullable RUINCopyPrimaryTalkContext(void);
 /** Returns copied DTOs on the main queue; unresolved names are omitted. */
 FOUNDATION_EXPORT void RUINLoadChatCatalog(void (^completion)(NSArray<NSDictionary *> *items, NSString *account));
 FOUNDATION_EXPORT NSDictionary *RUINChatCatalogDiagnostics(void);

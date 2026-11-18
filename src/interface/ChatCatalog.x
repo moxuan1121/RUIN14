@@ -45,9 +45,12 @@ typedef NS_ENUM(NSInteger, RUINChatCatalogInstallStatus) {
 @implementation RUINChatCatalogContextSnapshot
 @end
 
+NSNotificationName const RUINChatCatalogDidCaptureTalkContextNotification = @"RUINChatCatalogDidCaptureTalkContextNotification";
+
 static os_unfair_lock gChatCatalogLock = OS_UNFAIR_LOCK_INIT;
 static os_unfair_lock gChatCatalogInstallLock = OS_UNFAIR_LOCK_INIT;
 static NSHashTable<NSManagedObjectContext *> *gChatCatalogContexts;
+static __weak NSManagedObjectContext *gPrimaryTalkContext;
 static RUINChatCatalogInstallStatus gChatCatalogInstallStatus = RUINChatCatalogInstallNotRequested;
 static BOOL gChatCatalogInstalled;
 static atomic_uint_fast64_t gChatCatalogFetches = ATOMIC_VAR_INIT(0);
@@ -231,13 +234,34 @@ static void RUINCaptureChatCatalogContext(NSManagedObjectContext *context, NSFet
     if (!RUINRequestMatchesSchema(request, schema, model)) return;
     if (![RUINCurrentChatCatalogAccount() isEqualToString:account]) return;
 
+    NSURL *primaryStoreURL = schema == RUINChatCatalogSchemaTalk
+        ? context.persistentStoreCoordinator.persistentStores.firstObject.URL : nil;
+    BOOL isPrimaryTalkStore = [primaryStoreURL.lastPathComponent isEqualToString:@"Line.sqlite"];
+    BOOL notifyTalk = NO;
     os_unfair_lock_lock(&gChatCatalogLock);
     if (!gChatCatalogContexts) gChatCatalogContexts = [NSHashTable weakObjectsHashTable];
     [gChatCatalogContexts addObject:context];
+    if (isPrimaryTalkStore && context != gPrimaryTalkContext) {
+        gPrimaryTalkContext = context;
+        notifyTalk = YES;
+    }
     os_unfair_lock_unlock(&gChatCatalogLock);
     atomic_fetch_add_explicit(&gChatCatalogFetches, 1, memory_order_relaxed);
+    if (notifyTalk) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [NSNotificationCenter.defaultCenter postNotificationName:RUINChatCatalogDidCaptureTalkContextNotification object:nil];
+        });
+    }
 }
 #endif
+
+id RUINCopyPrimaryTalkContext(void)
+{
+    os_unfair_lock_lock(&gChatCatalogLock);
+    NSManagedObjectContext *context = gPrimaryTalkContext;
+    os_unfair_lock_unlock(&gChatCatalogLock);
+    return context;
+}
 
 static NSArray<NSManagedObjectContext *> *RUINCapturedChatContexts(void)
 {

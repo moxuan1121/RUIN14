@@ -435,17 +435,6 @@ static BOOL RUINClassOwnsSelector(Class cls, SEL selector)
     return owns;
 }
 
-static BOOL RUINNativeMyThemesClassOwnerMatches(Class cls)
-{
-    const char *owner = cls ? class_getImageName(cls) : NULL;
-    const char *executable = NSBundle.mainBundle.executablePath.fileSystemRepresentation;
-    char *ownerPath = owner ? realpath(owner, NULL) : NULL;
-    char *executablePath = executable ? realpath(executable, NULL) : NULL;
-    BOOL matches = ownerPath && executablePath && !strcmp(ownerPath, executablePath);
-    free(ownerPath); free(executablePath);
-    return matches;
-}
-
 NSDictionary *RUINNativeMyThemesObservationDiagnostics(void)
 {
     os_unfair_lock_lock(&gNativeMyThemesHandlerLock);
@@ -474,7 +463,7 @@ void RUINInstallNativeMyThemesDidAppearHook(void)
         gNativeMyThemesHookStatus = "appearance_method_abi_unavailable"; return;
     }
     gNativeMyThemesOwnAppearance = RUINClassOwnsSelector(cls, selector);
-    if (!RUINNativeMyThemesClassOwnerMatches(cls)) {
+    if (!RUINClassBelongsToBundleExecutable(cls)) {
         gNativeMyThemesHookStatus = "controller_class_owner_mismatch"; return;
     }
 

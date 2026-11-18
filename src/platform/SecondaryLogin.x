@@ -100,8 +100,9 @@ static void RUINScheduleLoginGuestImageProof(Class welcome) {
 static BOOL RUINLoginCallerIsUnpinnedGuest(const Dl_info *caller) {
     Class welcome = objc_getClass("_TtC18LineRegistrationUI21WelcomeViewController");
     const char *ownerPath = welcome ? class_getImageName(welcome) : NULL;
+    if (!ownerPath || !caller->dli_fbase || !caller->dli_fname) return NO;
     const RUINVersionMapping *mapping = RUINMappingForInfo(NSBundle.mainBundle.infoDictionary);
-    if (!mapping || !ownerPath || !caller->dli_fbase || !caller->dli_fname) return NO;
+    if (!mapping) return NO;
 
     // This caller is executing now, so its image must remain alive through the
     // public idiom query. Borrow that lifetime only for this call, never cache
@@ -140,8 +141,14 @@ static BOOL RUINLoginCallerIsLINE(void *caller) {
     Class welcome = objc_getClass("_TtC18LineRegistrationUI21WelcomeViewController");
     const char *ownerPath = welcome ? class_getImageName(welcome) : NULL;
     if (ownerPath && info.dli_fname && strcmp(ownerPath, info.dli_fname)) return NO;
-    RUINMainExecutableImage image;
-    if (RUINResolveMainExecutableImage(&image) && info.dli_fbase == (const void *)image.header) return YES;
+    // The strict main-executable resolver only matches MH_EXECUTE. Skip MH_DYLIB
+    // framework callers (e.g. UIKitCore during early scene-create) even before
+    // WelcomeViewController is registered, preventing uncached LC dyld/realpath storms.
+    const struct mach_header_64 *callerHeader = (const struct mach_header_64 *)info.dli_fbase;
+    if (callerHeader && callerHeader->magic == MH_MAGIC_64 && callerHeader->filetype == MH_EXECUTE) {
+        RUINMainExecutableImage image;
+        if (RUINResolveMainExecutableImage(&image) && info.dli_fbase == (const void *)image.header) return YES;
+    }
     // LINE can cache its role before the queued guest pin is able to run.
     return RUINLoginCallerIsUnpinnedGuest(&info);
 }

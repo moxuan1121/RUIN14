@@ -378,19 +378,24 @@ static void CheckLoginGuestImageProof(Class welcomeClass) {
     assert(!atomic_load(&verifiedLoginGuestImage));
     fixturePinAllowed = YES;
 
-    // LC's queued pin has not succeeded. Model UIKit repeatedly asking the
-    // actual hooked getter while LINE creates buttons/traits. Neither strict
+    // LC's queued pin has not succeeded, including during early scene-create
+    // before WelcomeViewController is registered. Model UIKit repeatedly asking
+    // the actual hooked getter while creating traits/bars. Neither strict
     // resolution nor the unpinned guest dyld scan may run for these callers.
     assert(!atomic_load(&verifiedLoginGuestImage));
     fixtureFrameworkCaller = YES;
-    uint64_t strictBeforeUIKit = atomic_load(&strictImageResolutions);
-    uint64_t dyldBeforeUIKit = atomic_load(&fixtureDyldImageQueries);
-    for (NSUInteger query = 0; query < 1000; query++)
-        assert(UIDevice.currentDevice.userInterfaceIdiom == physicalIdiom);
-    assert(atomic_load(&strictImageResolutions) == strictBeforeUIKit);
-    assert(atomic_load(&fixtureDyldImageQueries) == dyldBeforeUIKit);
+    for (NSUInteger ownerReady = 0; ownerReady < 2; ownerReady++) {
+        fixtureOwnerAvailable = ownerReady != 0;
+        uint64_t strictBeforeUIKit = atomic_load(&strictImageResolutions);
+        uint64_t dyldBeforeUIKit = atomic_load(&fixtureDyldImageQueries);
+        for (NSUInteger query = 0; query < 1000; query++)
+            assert(UIDevice.currentDevice.userInterfaceIdiom == physicalIdiom);
+        assert(atomic_load(&strictImageResolutions) == strictBeforeUIKit);
+        assert(atomic_load(&fixtureDyldImageQueries) == dyldBeforeUIKit);
+    }
+    fixtureOwnerAvailable = YES;
     fixtureFrameworkCaller = NO;
-    puts("PASS unpinned LC getter: 1000 UIKit idiom queries, zero strict/dyld scans, physical idiom retained");
+    puts("PASS unpinned LC getter: 2000 UIKit idiom queries (before & after Welcome owner), zero strict/dyld scans, physical idiom retained");
 
     // The action IMP now belongs to Foundation, while the original class owner
     // remains LINE. Never invoke this temporary replacement; only resolve owner.

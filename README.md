@@ -98,6 +98,9 @@ LINE の **「設定」タブ最下部** に追加される **「RUIN」** か�
    - 5言語の翻訳・設定情報・アイコンがバイナリ内に同梱されているため、外部の `RUINResources.bundle` は不要です（従来の外部バンドル併用も引き続き対応しています）。
 2. LiveContainer に LINE を導入し、標準の TweakLoader（Tweak 管理機能）から `RUIN-<version>-LiveContainer.dylib` を選択して LINE 向けに有効化します。
 
+> [!NOTE]
+> LiveContainer は dylib インポート時に既存チェックなしで `@executable_path/../../Tweaks` と `@loader_path` の `LC_RPATH` を追加するため、一度インポート済みのファイルを別フォルダ等へ再インポートすると起動時に `dlopen` が `duplicate LC_RPATH` で失敗します。必ず配布元またはビルド直後の未使用の `RUIN-<version>-LiveContainer.dylib` を 1 回だけインポートしてください。すでに重複した dylib を復旧する場合は macOS 上で `python3 tools/prepare_livecontainer.py <元のdylib> <出力dylib>` を実行して修復用コピーを作成できます。
+
 ### Sideload（IPA 注入・非脱獄）
 1. 未改変（RUIN 未注入）の LINE iOS **26.17.0** 復号済み IPA と、リリースページの `RUIN-<version>-jailed.deb` を用意します（RUIN 注入済み IPA には二重注入しないでください）。
    - `jailed.deb` 内では `/Library/MobileSubstrate/DynamicLibraries/` 配下に `RUIN.dylib` と `RUINResources.bundle` が格納されています。

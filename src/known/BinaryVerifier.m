@@ -69,11 +69,18 @@ BOOL RUINResolveMainExecutableImageFromCandidates(const char *executablePath,
     for (size_t i = 0; i < count; i++) {
         const RUINDyldImageCandidate *candidate = &candidates[i];
         uint8_t candidateUUID[16];
-        char *candidatePath = CanonicalImagePath(candidate->imageName);
-        if (!candidatePath) continue;
-        BOOL sameImage = !strcmp(expectedPath, candidatePath);
-        free(candidatePath);
-        if (!sameImage) continue;
+        // Dyld lists hundreds of shared/system dylibs; skip non-executables
+        // before calling realpath() on every image path at startup.
+        if (!candidate->header || candidate->header->magic != MH_MAGIC_64 ||
+            candidate->header->filetype != MH_EXECUTE) continue;
+        if (!candidate->imageName) continue;
+        if (strcmp(expectedPath, candidate->imageName) != 0) {
+            char *candidatePath = CanonicalImagePath(candidate->imageName);
+            if (!candidatePath) continue;
+            BOOL sameImage = !strcmp(expectedPath, candidatePath);
+            free(candidatePath);
+            if (!sameImage) continue;
+        }
         if (!ImageUUID(candidate->header, candidateUUID)) { ambiguous = YES; break; }
         if (match) {
             if (match->header != candidate->header || match->slide != candidate->slide ||

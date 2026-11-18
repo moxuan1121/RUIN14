@@ -25,10 +25,7 @@ static BOOL SameValue(NSString *left, NSString *right) {
 }
 
 static BOOL ClassBelongs(Class cls) {
-    const char *path = cls ? class_getImageName(cls) : NULL;
-    NSString *owner = path ? [NSString stringWithUTF8String:path].stringByResolvingSymlinksInPath : nil;
-    NSString *host = NSBundle.mainBundle.executablePath.stringByResolvingSymlinksInPath;
-    return host.length && [owner isEqualToString:host];
+    return RUINClassBelongsToBundleExecutable(cls);
 }
 
 static NSString *ProjectedValue(NSString *native, NSUInteger count) {

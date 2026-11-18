@@ -21,19 +21,27 @@ static NSString *const ViewedBoundariesKey = @"RUINViewedUnreadBoundaries";
 - (BOOL)isSendMessage;
 @end
 
+static NSString *BadgeRelativeStorePath(NSPersistentStore *store, NSString *account) {
+    if (!account.length || !store.URL.isFileURL || ![store.URL.lastPathComponent isEqual:@"Line.sqlite"]) return nil;
+    NSArray *parts = store.URL.path.pathComponents;
+    NSUInteger index = [parts indexOfObject:@"PrivateStore"];
+    if (index == NSNotFound || index + 2 >= parts.count || ![parts[index + 2] isEqual:@"Messages"] ||
+        (![parts[index + 1] isEqual:[@"P_" stringByAppendingString:account]] &&
+         ![parts[index + 1] isEqual:[@"S_" stringByAppendingString:account]])) return nil;
+    // Hash from PrivateStore onward so sandbox/AppGroup container UUID changes across
+    // app updates do not invalidate existing viewed-unread markers for the same store.
+    return [[parts subarrayWithRange:NSMakeRange(index, parts.count - index)] componentsJoinedByString:@"/"];
+}
+
 // Called only on the managed object's queue. A store/account mismatch must
 // never carry a viewed boundary into another login or a cloned store.
 static NSString *BadgeScope(NSManagedObject *chat, NSString *account) {
     if (!account.length || chat.isDeleted || chat.objectID.isTemporaryID ||
         ![chat isKindOfClass:NSClassFromString(@"ManagedChat")]) return nil;
     NSPersistentStore *store = chat.objectID.persistentStore;
-    NSArray *parts = store.URL.path.pathComponents;
-    NSUInteger index = [parts indexOfObject:@"PrivateStore"];
-    if (!store.URL.isFileURL || ![store.URL.lastPathComponent isEqual:@"Line.sqlite"] ||
-        index == NSNotFound || index + 2 >= parts.count || ![parts[index + 2] isEqual:@"Messages"] ||
-        (!([parts[index + 1] isEqual:[@"P_" stringByAppendingString:account]]) &&
-         !([parts[index + 1] isEqual:[@"S_" stringByAppendingString:account]]))) return nil;
-    NSData *data = [NSJSONSerialization dataWithJSONObject:@[account, store.URL.path,
+    NSString *storeKey = BadgeRelativeStorePath(store, account);
+    if (!storeKey) return nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:@[account, storeKey,
         chat.objectID.URIRepresentation.absoluteString] options:0 error:NULL];
     if (!data || data.length > UINT_MAX) return nil;
     unsigned char digest[CC_SHA256_DIGEST_LENGTH];
@@ -43,22 +51,47 @@ static NSString *BadgeScope(NSManagedObject *chat, NSString *account) {
     return key;
 }
 
-static BOOL BadgeSchema(NSManagedObject *chat) {
-    NSDictionary *attributes = chat.entity.attributesByName;
+static BOOL BadgeEntityHasSchema(NSEntityDescription *entity) {
+    NSDictionary *attributes = entity.attributesByName;
     return [attributes[@"lastReceivedMessageID"] attributeType] == NSInteger64AttributeType &&
         [attributes[@"readUpToMessageID"] attributeType] == NSInteger64AttributeType &&
         [attributes[@"unread"] attributeType] == NSInteger32AttributeType;
 }
 
-static BOOL ValidBadgeInteger(id value, unsigned long long minimum, unsigned long long maximum) {
-    if (![value isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID()) return NO;
-    NSString *digits = [value stringValue];
+static BOOL BadgeSchema(NSManagedObject *chat) {
+    return BadgeEntityHasSchema(chat.entity);
+}
+
+static BOOL ParseDecimalInteger(id value, BOOL expectString, unsigned long long minimum,
+                                unsigned long long maximum, unsigned long long *output) {
+    NSString *digits = nil;
+    if (expectString) {
+        if (![value isKindOfClass:NSString.class]) return NO;
+        digits = value;
+        if (digits.length > 1 && [digits characterAtIndex:0] == '0') return NO;
+    } else {
+        if (![value isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID()) return NO;
+        digits = [value stringValue];
+    }
     if (!digits.length || digits.length > 19) return NO;
     for (NSUInteger i = 0; i < digits.length; i++)
         if ([digits characterAtIndex:i] < '0' || [digits characterAtIndex:i] > '9') return NO;
     errno = 0;
     unsigned long long number = strtoull(digits.UTF8String, NULL, 10);
-    return !errno && number >= minimum && number <= maximum;
+    if (errno || number < minimum || number > maximum) return NO;
+    if (output) *output = number;
+    return YES;
+}
+
+static BOOL ValidBadgeInteger(id value, unsigned long long minimum, unsigned long long maximum) {
+    return ParseDecimalInteger(value, NO, minimum, maximum, NULL);
+}
+
+static BOOL ParsePositiveMessageID(id value, BOOL stringIDs, long long *output) {
+    unsigned long long parsed = 0;
+    if (!ParseDecimalInteger(value, stringIDs, 1, LLONG_MAX, &parsed)) return NO;
+    if (output) *output = (long long)parsed;
+    return YES;
 }
 
 static BOOL ValidBoundary(id value) { return ValidBadgeInteger(value, 1, LLONG_MAX); }
@@ -112,8 +145,10 @@ static BOOL BadgeMessages(NSManagedObject *chat, long long lower, long long rece
     NSManagedObjectContext *context = chat.managedObjectContext;
     NSEntityDescription *message = context.persistentStoreCoordinator.managedObjectModel.entitiesByName[@"Message"];
     NSRelationshipDescription *relationship = message.relationshipsByName[@"chat"];
+    NSAttributeType idType = message.attributesByName[@"id"].attributeType;
+    BOOL stringIDs = idType == NSStringAttributeType;
     Class messageClass = NSClassFromString(@"ManagedMessage");
-    if (message.attributesByName[@"id"].attributeType != NSInteger64AttributeType ||
+    if ((idType != NSInteger64AttributeType && !stringIDs) ||
         relationship.isToMany || relationship.destinationEntity != chat.entity || !messageClass) return NO;
     SEL selectors[] = {@selector(shouldIncrementChatMessagesUnread), @selector(isReceivedMessage), @selector(isSendMessage)};
     for (NSUInteger i = 0; i < sizeof(selectors) / sizeof(*selectors); i++) {
@@ -122,7 +157,22 @@ static BOOL BadgeMessages(NSManagedObject *chat, long long lower, long long rece
         if (!encoding || encoding[0] != @encode(BOOL)[0] || strcmp(encoding + 1, "16@0:8")) return NO;
     }
     NSFetchRequest *request = [NSFetchRequest fetchRequestWithEntityName:@"Message"];
-    request.predicate = [NSPredicate predicateWithFormat:@"chat == %@ AND id > %lld AND id <= %lld", chat, lower, received];
+    if (stringIDs) {
+        // LINE's Message.id is NSStringAttributeType holding decimal Snowflake IDs.
+        NSString *lowerString = [NSString stringWithFormat:@"%lld", lower];
+        NSString *receivedString = [NSString stringWithFormat:@"%lld", received];
+        if (lower > 0 && lowerString.length == receivedString.length) {
+            NSString *widthPattern = [@"" stringByPaddingToLength:receivedString.length withString:@"?" startingAtIndex:0];
+            request.predicate = [NSPredicate predicateWithFormat:@"chat == %@ AND id > %@ AND id <= %@ AND id LIKE %@",
+                chat, lowerString, receivedString, widthPattern];
+        } else {
+            request.predicate = [NSPredicate predicateWithFormat:@"chat == %@", chat];
+            if (message.attributesByName[@"timestamp"].attributeType == NSInteger64AttributeType)
+                request.sortDescriptors = @[[NSSortDescriptor sortDescriptorWithKey:@"timestamp" ascending:NO]];
+        }
+    } else {
+        request.predicate = [NSPredicate predicateWithFormat:@"chat == %@ AND id > %lld AND id <= %lld", chat, lower, received];
+    }
     request.affectedStores = @[chat.objectID.persistentStore];
     request.fetchLimit = 1001;
     request.returnsObjectsAsFaults = NO;
@@ -133,7 +183,9 @@ static BOOL BadgeMessages(NSManagedObject *chat, long long lower, long long rece
         if (![item isKindOfClass:messageClass]) return NO;
         id<RUINUnreadMessage> candidate = (id)item;
         if ([candidate isReceivedMessage] && ![candidate isSendMessage]) {
-            long long number = [[item valueForKey:@"id"] longLongValue];
+            long long number = 0;
+            if (!ParsePositiveMessageID([item valueForKey:@"id"], stringIDs, &number)) continue;
+            if (number <= lower || number > received) continue;
             *foundLatest |= number == received;
             if ([candidate shouldIncrementChatMessagesUnread]) {
                 (*total)++;
@@ -157,12 +209,13 @@ static NSInteger BadgeCount(NSManagedObject *chat, id viewed) {
     BOOL snapshot = [viewed isKindOfClass:NSDictionary.class];
     if (received < boundary || (!snapshot && read >= boundary))
         return BadgeOutcome(native, "cursor_rebased_or_native_read", native, -1, -1, -1);
-    if (received == boundary) return BadgeOutcome(0, "viewed_boundary_unchanged", native, -1, -1, 0);
+    NSInteger baseline = snapshot ? [viewed[@"nativeUnread"] integerValue] : -1;
+    if (received == boundary)
+        return BadgeOutcome(0, "viewed_boundary_unchanged", native, baseline, snapshot ? native - baseline : -1, 0);
 
-    NSInteger baseline = -1, delta = -1, tail = -1;
+    NSInteger delta = -1, tail = -1;
     const char *fallback = "legacy_full_window_unverified";
     if (snapshot) {
-        baseline = [viewed[@"nativeUnread"] integerValue];
         delta = native - baseline;
         if (read != [viewed[@"readCursor"] longLongValue]) fallback = "snapshot_read_cursor_changed";
         else if (delta < 0) fallback = "snapshot_native_decreased";
@@ -231,17 +284,30 @@ static NSUInteger BadgeCorrection(NSManagedObjectContext *context, NSPersistentS
 - (id)chat;
 @end
 
+@interface RUINBadgeButton : UIButton
+@end
+
 @interface RUINBadgeDisplay : NSObject
+@property(nonatomic, weak) NSManagedObject *chat;
 @property(nonatomic, weak) UIButton *button;
 @property(nonatomic, copy) NSString *title;
 @property(nonatomic, copy) NSAttributedString *attributedTitle;
 @property(nonatomic) BOOL hidden;
 @property(nonatomic) BOOL overridden;
+@property(nonatomic) NSInteger targetCount;
+@property(nonatomic, copy) NSString *targetTitle;
 @property(nonatomic) NSUInteger generation;
 @end
 @implementation RUINBadgeDisplay @end
 
-static char DisplayKey;
+@interface RUINBadgeButtonRef : NSObject
+@property(nonatomic, weak) RUINBadgeDisplay *record;
+@end
+@implementation RUINBadgeButtonRef @end
+
+static char DisplayKey, ButtonRecordKey;
+static Class hookedButtonClass;
+static BOOL applyingButtonState;
 static NSMutableDictionary *viewedBoundaries;
 static NSHashTable *cells;
 static BOOL installed;
@@ -255,6 +321,7 @@ static NSUInteger totalsGeneration;
 static BOOL totalsScheduled, rowsScheduled;
 static NSUInteger mainContextSnapshots, privateContextSnapshots;
 static void RefreshCells(void);
+static void InstallBadgeButtonHooks(UIButton *button);
 
 static BOOL Enabled(void) {
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
@@ -271,15 +338,59 @@ static RUINBadgeDisplay *Display(UIView *cell) {
     return record;
 }
 
+static NSAttributedString *UpdatedBadgeAttributedTitle(NSAttributedString *title, NSString *targetTitle) {
+    if (!title || !targetTitle.length) return nil;
+    NSMutableAttributedString *updated = [title mutableCopy];
+    [updated replaceCharactersInRange:NSMakeRange(0, updated.length) withString:targetTitle];
+    return updated;
+}
+
+static void BindButtonRecord(UIButton *button, RUINBadgeDisplay *record) {
+    if (!button) return;
+    RUINBadgeButtonRef *ref = [RUINBadgeButtonRef new];
+    ref.record = record;
+    objc_setAssociatedObject(button, &ButtonRecordKey, ref, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void UnbindButtonRecord(UIButton *button, RUINBadgeDisplay *record) {
+    if (!button) return;
+    RUINBadgeButtonRef *ref = objc_getAssociatedObject(button, &ButtonRecordKey);
+    if (!ref || ref.record == record) {
+        ref.record = nil;
+        objc_setAssociatedObject(button, &ButtonRecordKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+static void ApplyButtonState(RUINBadgeDisplay *record) {
+    UIButton *button = record.button;
+    if (!button || !record.overridden) return;
+    BOOL wasApplying = applyingButtonState;
+    applyingButtonState = YES;
+    if (record.targetCount == 0) {
+        button.hidden = YES;
+        applyingButtonState = wasApplying;
+        return;
+    }
+    if (!button.hidden && record.targetTitle.length) {
+        [button setTitle:record.targetTitle forState:UIControlStateNormal];
+        NSAttributedString *text = UpdatedBadgeAttributedTitle(record.attributedTitle, record.targetTitle);
+        if (text) [button setAttributedTitle:text forState:UIControlStateNormal];
+    }
+    applyingButtonState = wasApplying;
+}
+
 static void Restore(UIView *cell) {
     RUINBadgeDisplay *record = Display(cell);
     record.generation++;
     if (!record.overridden) return;
     UIButton *button = record.button;
+    UnbindButtonRecord(button, record);
+    record.overridden = NO;
     button.hidden = record.hidden;
     [button setTitle:record.title forState:UIControlStateNormal];
     [button setAttributedTitle:record.attributedTitle forState:UIControlStateNormal];
-    record.overridden = NO;
+    record.chat = nil;
+    record.targetTitle = nil;
 }
 
 static void OnChatQueue(NSManagedObject *chat, dispatch_block_t work) {
@@ -336,6 +447,29 @@ static void BindTotalsSource(NSManagedObjectContext *source, NSPersistentStoreCo
     RUINRefreshLocalUnreadBadgeTotals();
 }
 
+static void TryBindCatalogSource(void) {
+    if (!NSThread.isMainThread || sourceContext || !Enabled()) return;
+    id raw = RUINCopyPrimaryTalkContext();
+    if (![raw isKindOfClass:NSManagedObjectContext.class]) return;
+    NSManagedObjectContext *captured = raw;
+    if (captured.concurrencyType != NSMainQueueConcurrencyType &&
+        captured.concurrencyType != NSPrivateQueueConcurrencyType) return;
+    NSString *account = RUINChatCatalogAccount();
+    if (!account.length) return;
+    void (^inspect)(void) = ^{
+        NSPersistentStoreCoordinator *coordinator = captured.persistentStoreCoordinator;
+        NSPersistentStore *store = coordinator.persistentStores.firstObject;
+        NSEntityDescription *chat = coordinator.managedObjectModel.entitiesByName[@"Chat"];
+        if (!BadgeRelativeStorePath(store, account) || !BadgeEntityHasSchema(chat)) return;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!sourceContext && Enabled() && [account isEqual:RUINChatCatalogAccount()])
+                BindTotalsSource(captured, coordinator, store, account);
+        });
+    };
+    if (captured.concurrencyType == NSMainQueueConcurrencyType) inspect();
+    else [captured performBlock:inspect];
+}
+
 static void Apply(RUINBadgeCell *cell) {
     if (!NSThread.isMainThread) return;
     Restore(cell);
@@ -369,21 +503,17 @@ static void Apply(RUINBadgeCell *cell) {
                 RUINCopySwiftField(current, "unreadCountButton") != button) return;
             if (validSource) BindTotalsSource(owner, coordinator, store, account);
             if (count < 0) return;
+            InstallBadgeButtonHooks(button);
+            record.chat = chat;
             record.button = button;
             record.hidden = button.hidden;
             record.title = [button titleForState:UIControlStateNormal];
             record.attributedTitle = [button attributedTitleForState:UIControlStateNormal];
+            record.targetCount = count;
+            record.targetTitle = count > 0 ? [NSString localizedStringWithFormat:@"%ld", (long)count] : nil;
             record.overridden = YES;
-            if (count == 0) button.hidden = YES;
-            else if (!button.hidden) {
-                NSString *title = [NSString localizedStringWithFormat:@"%ld", (long)count];
-                [button setTitle:title forState:UIControlStateNormal];
-                if (record.attributedTitle) {
-                    NSMutableAttributedString *text = [record.attributedTitle mutableCopy];
-                    [text replaceCharactersInRange:NSMakeRange(0, text.length) withString:title];
-                    [button setAttributedTitle:text forState:UIControlStateNormal];
-                }
-            }
+            BindButtonRecord(button, record);
+            ApplyButtonState(record);
             displayChanges++;
         });
     });
@@ -438,6 +568,54 @@ static void Remember(RUINBadgeChatController *controller) {
     });
 }
 
+static void EnforceDisplay(RUINBadgeCell *cell) {
+    if (!NSThread.isMainThread || !Enabled() || !cell.window) return;
+    RUINBadgeDisplay *record = objc_getAssociatedObject(cell, &DisplayKey);
+    if (!record || !record.overridden || !record.button) return;
+    if (RUINCopySwiftField(cell, "chatObject") != record.chat ||
+        RUINCopySwiftField(cell, "unreadCountButton") != record.button) {
+        Apply(cell);
+        return;
+    }
+    ApplyButtonState(record);
+}
+
+static RUINBadgeDisplay *ActiveRecordForButton(id button) {
+    if (applyingButtonState) return nil;
+    RUINBadgeButtonRef *ref = objc_getAssociatedObject(button, &ButtonRecordKey);
+    RUINBadgeDisplay *record = ref.record;
+    if (!record || !record.overridden || record.button != button || !Enabled()) return nil;
+    return record;
+}
+
+%group RUINLocalBadgeButtons
+%hook RUINBadgeButton
+- (void)setHidden:(BOOL)hidden {
+    RUINBadgeDisplay *record = ActiveRecordForButton(self);
+    if (!record) { %orig; return; }
+    record.hidden = hidden;
+    if (record.targetCount == 0) { %orig(YES); return; }
+    %orig;
+    if (!hidden) ApplyButtonState(record);
+}
+- (void)setTitle:(NSString *)title forState:(UIControlState)state {
+    RUINBadgeDisplay *record = (state == UIControlStateNormal) ? ActiveRecordForButton(self) : nil;
+    if (!record) { %orig; return; }
+    record.title = title;
+    if (record.targetCount > 0 && record.targetTitle.length) { %orig(record.targetTitle, state); return; }
+    %orig;
+}
+- (void)setAttributedTitle:(NSAttributedString *)title forState:(UIControlState)state {
+    RUINBadgeDisplay *record = (state == UIControlStateNormal) ? ActiveRecordForButton(self) : nil;
+    if (!record) { %orig; return; }
+    record.attributedTitle = title;
+    NSAttributedString *updated = record.targetCount > 0 ? UpdatedBadgeAttributedTitle(title, record.targetTitle) : nil;
+    if (updated) { %orig(updated, state); return; }
+    %orig;
+}
+%end
+%end
+
 %group RUINLocalBadgeCells
 %hook RUINBadgeCell
 - (BOOL)render {
@@ -447,6 +625,7 @@ static void Remember(RUINBadgeChatController *controller) {
     return result;
 }
 - (void)didMoveToWindow { Restore((id)self); %orig; Apply((id)self); }
+- (void)layoutSubviews { %orig; EnforceDisplay((id)self); }
 - (void)prepareForReuse { Restore((id)self); %orig; }
 %end
 %end
@@ -466,12 +645,26 @@ static void Remember(RUINBadgeChatController *controller) {
 %end
 %end
 
-static BOOL MethodMatches(Class cls, SEL selector, const char *encoding) {
-    const char *path = cls ? class_getImageName(cls) : NULL;
-    NSString *owner = path ? [NSString stringWithUTF8String:path].stringByResolvingSymlinksInPath : nil;
-    NSString *host = NSBundle.mainBundle.executablePath.stringByResolvingSymlinksInPath;
+static BOOL SelectorHasEncoding(Class cls, SEL selector, const char *encoding) {
     Method method = cls ? class_getInstanceMethod(cls, selector) : NULL;
-    return host.length && [owner isEqual:host] && method && !strcmp(method_getTypeEncoding(method), encoding);
+    const char *types = method ? method_getTypeEncoding(method) : NULL;
+    return types && !strcmp(types, encoding) && method_getImplementation(method);
+}
+
+static BOOL MethodMatches(Class cls, SEL selector, const char *encoding) {
+    return RUINClassBelongsToBundleExecutable(cls) && SelectorHasEncoding(cls, selector, encoding);
+}
+
+static void InstallBadgeButtonHooks(UIButton *button) {
+    if (hookedButtonClass || !button) return;
+    Class buttonClass = button.class;
+    if (![buttonClass isSubclassOfClass:UIButton.class]) return;
+    if (!RUINClassBelongsToBundleExecutable(buttonClass) && buttonClass != UIButton.class) return;
+    if (!SelectorHasEncoding(buttonClass, @selector(setHidden:), "v20@0:8B16") ||
+        !SelectorHasEncoding(buttonClass, @selector(setTitle:forState:), "v32@0:8@16Q24") ||
+        !SelectorHasEncoding(buttonClass, @selector(setAttributedTitle:forState:), "v32@0:8@16Q24")) return;
+    hookedButtonClass = buttonClass;
+    %init(RUINLocalBadgeButtons, RUINBadgeButton=buttonClass);
 }
 
 void RUINInstallLocalUnreadBadges(void) {
@@ -485,6 +678,8 @@ void RUINInstallLocalUnreadBadges(void) {
                 ValidViewedMarker(saved[key]) && viewedBoundaries.count < 2048) viewedBoundaries[key] = [saved[key] copy];
         }
         cells = [NSHashTable weakObjectsHashTable];
+        [NSNotificationCenter.defaultCenter addObserverForName:RUINChatCatalogDidCaptureTalkContextNotification
+            object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *notification) { TryBindCatalogSource(); }];
         for (NSNotificationName name in @[NSManagedObjectContextObjectsDidChangeNotification, NSManagedObjectContextDidSaveNotification,
             @"kNLNotificationKeyUnreadCount", @"unreadMessageCountDidUpdate"])
             [NSNotificationCenter.defaultCenter addObserverForName:name object:nil queue:nil usingBlock:^(NSNotification *notification) {
@@ -493,6 +688,7 @@ void RUINInstallLocalUnreadBadges(void) {
                     [notification.name isEqual:@"unreadMessageCountDidUpdate"];
                 // Never make a native Core Data posting queue wait for UIKit.
                 dispatch_async(dispatch_get_main_queue(), ^{
+                    if (!sourceContext && Enabled()) TryBindCatalogSource();
                     if ((!nativeCounter && changed != sourceContext) || !Enabled() || rowsScheduled) return;
                     rowsScheduled = YES;
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
@@ -508,6 +704,7 @@ void RUINInstallLocalUnreadBadges(void) {
         Class chat = NSClassFromString(@"LineMessagingUI.ChatViewController");
         if (!MethodMatches(cell, @selector(render), "B16@0:8") ||
             !MethodMatches(cell, @selector(didMoveToWindow), "v16@0:8") ||
+            !MethodMatches(cell, @selector(layoutSubviews), "v16@0:8") ||
             !MethodMatches(cell, @selector(prepareForReuse), "v16@0:8") ||
             !MethodMatches(chat, @selector(chat), "@16@0:8") ||
             !MethodMatches(chat, @selector(viewDidAppear:), "v20@0:8B16") ||
@@ -527,6 +724,7 @@ void RUINInstallLocalUnreadBadges(void) {
             object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *notification) { Remember(visibleChat); }];
     }
     RUINInstallLocalUnreadTabBadge();
+    TryBindCatalogSource();
     RefreshCells();
     RUINRefreshLocalUnreadBadgeTotals();
 }

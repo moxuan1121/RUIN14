@@ -78,6 +78,11 @@ static const char *FixtureClassImageName(Class cls) {
     return cls == foreignClass ? "/foreign/fixture.dylib" : NSBundle.mainBundle.executablePath.fileSystemRepresentation;
 }
 #define class_getImageName FixtureClassImageName
+static BOOL RUINClassBelongsToBundleExecutable(Class cls) {
+    const char *owner = cls ? class_getImageName(cls) : NULL;
+    const char *host = NSBundle.mainBundle.executablePath.fileSystemRepresentation;
+    return owner && host && !strcmp(owner, host);
+}
 static NSUInteger totalsRefreshes, feedbackCorrection;
 void RUINRefreshLocalUnreadBadgeTotals(void) {
     totalsRefreshes++;

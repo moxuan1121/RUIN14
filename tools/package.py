@@ -82,8 +82,10 @@ def main():
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
-    # ditto preserves executable permissions and bundle structure from the IPA.
-    run('/usr/bin/ditto', '-x', '-k', a.ipa.resolve(), out)
+    # ditto preserves executable permissions and bundle structure from the IPA;
+    # strip macOS resource/extended attributes so iOS installd does not extract
+    # AppleDouble (._*) files that invalidate the sealed signature.
+    run('/usr/bin/ditto', '-x', '-k', '--norsrc', '--noextattr', '--noqtn', '--noacl', a.ipa.resolve(), out)
     apps = list((out / 'Payload').glob('*.app'))
     if len(apps) != 1:
         raise ValueError('Expected exactly one app in Payload.')
@@ -189,6 +191,7 @@ def main():
                 if main_app:
                     args += ['--entitlements', ent_path]
                 run(*args, path, capture=True)
+            run('xattr', '-cr', app)
             for dylib in sorted(app.rglob('*.dylib'), key=lambda x: len(x.parts), reverse=True):
                 sign(dylib)
             for framework in sorted(app.rglob('*.framework'), key=lambda x: len(x.parts), reverse=True):
@@ -206,7 +209,8 @@ def main():
     dist.mkdir(exist_ok=True)
     ipa = dist / f'RUIN-LINE-{source_identity["version"]}.ipa'
     staging_ipa = ipa.with_suffix('.tmp.ipa')
-    run('/usr/bin/ditto', '-c', '-k', '--keepParent', out / 'Payload', staging_ipa)
+    run('/usr/bin/ditto', '-c', '-k', '--norsrc', '--noextattr', '--noqtn', '--noacl',
+        '--keepParent', out / 'Payload', staging_ipa)
     staging_ipa.replace(ipa)
     print(f'Signed app: {app}\nSigned IPA: {ipa}\nBundle ID: {bundle_id}', flush=True)
 
