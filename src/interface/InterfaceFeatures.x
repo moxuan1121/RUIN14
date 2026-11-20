@@ -2290,7 +2290,25 @@ static void RUINApplyStartupSelection(UITabBarController *controller, NSArray *c
     atomic_store(&gStartupStatus, 4); // unavailable or hidden
 }
 
+static void RUINApplyRequestedControllers18(UITabBarController *controller, BOOL allowStartup) API_AVAILABLE(ios(18.0));
+// LINE14 port: UIKit compact-tab filtering (UITab) exists only on iOS 18+.
+// Older systems keep LINE's native tab UI untouched (legacy layout path).
 static void RUINApplyRequestedControllers(UITabBarController *controller, BOOL allowStartup)
+{
+    if (@available(iOS 18.0, *)) { RUINApplyRequestedControllers18(controller, allowStartup); return; }
+    NSArray *native = [controller.viewControllers copy] ?: @[];
+    BOOL nativeGeneration = [RUINNativeTabAvailabilityDiagnostics()[@"status"] intValue] == 5;
+    NSArray *allowed = nativeGeneration ? native : RUINFilteredControllers(native);
+    NSArray *startupSelectable = nativeGeneration ? RUINFilteredControllers(native) : allowed;
+    atomic_store(&gNativeTabCount, native.count);
+    atomic_store(&gUIKitTabCount, 0);
+    RUINRegisterTabController(controller);
+    objc_setAssociatedObject(controller, &gRequestedControllersKey, native, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    atomic_store(&gTabVisibilityStatus, allowed.count == native.count ? 1 : 3);
+    if (allowStartup) RUINApplyStartupSelection(controller, startupSelectable);
+}
+
+static void RUINApplyRequestedControllers18(UITabBarController *controller, BOOL allowStartup)
 {
     // LINE's own navigation/notification code indexes the original controller
     // array. Never remove or reorder it: filter only UIKit's compact tab UI.

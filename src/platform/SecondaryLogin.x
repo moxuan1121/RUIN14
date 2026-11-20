@@ -294,7 +294,8 @@ static BOOL RUINPointIsOnNativeLoginButton(UIViewController *owner, CGPoint poin
     // Ask the native container for this touch before enumerating its children.
     // SwiftUI may materialize an AX hit without exposing a full child graph;
     // distinct wrappers in that graph need not be distinct buttons. iOS 18+.
-    id hit = [root accessibilityHitTest:screenPoint.origin withEvent:nil];
+    id hit = nil;
+    if (@available(iOS 18.0, *)) hit = [root accessibilityHitTest:screenPoint.origin withEvent:nil];
     NSString *hitIdentifier = [hit respondsToSelector:@selector(accessibilityIdentifier)] ?
         [(id<UIAccessibilityIdentification>)hit accessibilityIdentifier] : nil;
     // Some containers return themselves without identifying a button; preserve
