@@ -86,6 +86,7 @@ static void RUINStyledTabsViewDidAppear(id self, SEL selector, BOOL animated);
 static void RUINForceHidden(RUINViewTarget *target, id self, SEL selector, BOOL hidden);
 static void RUINViewDidMoveToWindow(RUINViewTarget *target, id self, SEL selector);
 static void RUINVoiceButtonLayout(id self, SEL selector);
+static void RUINLINE14ScheduleSmartChProbe(UIView *view);
 
 #define RUIN_HOOK(class_name, selector, types) \
     { class_name, selector, types, ATOMIC_VAR_INIT(NULL), \
@@ -130,6 +131,11 @@ typedef NS_ENUM(NSUInteger, RUINViewTargetIndex) {
     RUINViewAdWalletNativeBannerView,
     RUINViewAdWalletView,
     RUINViewVOOMVideoADContentCell,
+    RUINViewLINE14LANBannerTableViewCell,
+    RUINViewLINE14LANBannerContainer,
+    RUINViewLINE14LADgBannerContainer,
+    RUINViewLINE14LADAdView,
+    RUINViewLINE14SmartChView,
     RUINViewContentRecommendationView,
     RUINViewFriendRecommendationTableViewCell,
     RUINViewRecommendAddFriendPanelView,
@@ -159,6 +165,12 @@ static RUINViewTarget gViewTargets[] = {
     [RUINViewAdWalletNativeBannerView] = RUIN_VIEW_TARGET("_TtC20LineAdFeatureSupport24AdWalletNativeBannerView", RUINHideGroupAds),
     [RUINViewAdWalletView] = RUIN_VIEW_TARGET("_TtC20LineAdFeatureSupport12AdWalletView", RUINHideGroupAds),
     [RUINViewVOOMVideoADContentCell] = RUIN_VIEW_TARGET("_TtC21LineLightsUISubsystem22VOOMVideoADContentCell", RUINHideGroupAds),
+    // LINE 14.6.3 ad surfaces (home LAN banner, generic LAD view, chat-list SmartChannel).
+    [RUINViewLINE14LANBannerTableViewCell] = RUIN_VIEW_TARGET("_TtC11LineHomeTab22LANBannerTableViewCell", RUINHideGroupAds),
+    [RUINViewLINE14LANBannerContainer] = RUIN_VIEW_TARGET("_TtC11LineHomeTab18LANBannerContainer", RUINHideGroupAds),
+    [RUINViewLINE14LADgBannerContainer] = RUIN_VIEW_TARGET("_TtC11LineHomeTab19LADgBannerContainer", RUINHideGroupAds),
+    [RUINViewLINE14LADAdView] = RUIN_VIEW_TARGET("_TtC17LineAdvertiseSDK29LADAdView", RUINHideGroupAds),
+    [RUINViewLINE14SmartChView] = RUIN_VIEW_TARGET("_TtC11LineSmartCh11SmartChView", RUINHideGroupAds),
 
     [RUINViewContentRecommendationView] = RUIN_VIEW_TARGET("_TtC11LineHomeTab25ContentRecommendationView", RUINHideGroupRecommendations),
     [RUINViewFriendRecommendationTableViewCell] = RUIN_VIEW_TARGET("_TtC11LineHomeTab33FriendRecommendationTableViewCell", RUINHideGroupRecommendations),
@@ -332,6 +344,102 @@ static BOOL RUINKeepNativeMenusForLaunch(void) {
     IMP original = (IMP)&%orig;
     if (original) atomic_store_explicit(&gVoiceButtonLayoutHook.original, original, memory_order_release);
     RUINVoiceButtonLayout(self, _cmd);
+}
+%end
+%end
+
+%group RUINHideLINE14LANBannerTableViewCell
+%hook RUINLINE14LANBannerTableViewCell
+- (void)setHidden:(BOOL)hidden
+{
+    RUINViewTarget *target = &gViewTargets[RUINViewLINE14LANBannerTableViewCell];
+    IMP original = (IMP)&%orig;
+    if (original) atomic_store_explicit(&target->setHidden.original, original, memory_order_release);
+    RUINForceHidden(target, self, _cmd, hidden);
+}
+- (void)didMoveToWindow
+{
+    RUINViewTarget *target = &gViewTargets[RUINViewLINE14LANBannerTableViewCell];
+    IMP original = (IMP)&%orig;
+    if (original) atomic_store_explicit(&target->didMoveToWindow.original, original, memory_order_release);
+    RUINViewDidMoveToWindow(target, self, _cmd);
+}
+%end
+%end
+
+%group RUINHideLINE14LANBannerContainer
+%hook RUINLINE14LANBannerContainer
+- (void)setHidden:(BOOL)hidden
+{
+    RUINViewTarget *target = &gViewTargets[RUINViewLINE14LANBannerContainer];
+    IMP original = (IMP)&%orig;
+    if (original) atomic_store_explicit(&target->setHidden.original, original, memory_order_release);
+    RUINForceHidden(target, self, _cmd, hidden);
+}
+- (void)didMoveToWindow
+{
+    RUINViewTarget *target = &gViewTargets[RUINViewLINE14LANBannerContainer];
+    IMP original = (IMP)&%orig;
+    if (original) atomic_store_explicit(&target->didMoveToWindow.original, original, memory_order_release);
+    RUINViewDidMoveToWindow(target, self, _cmd);
+}
+%end
+%end
+
+%group RUINHideLINE14LADgBannerContainer
+%hook RUINLINE14LADgBannerContainer
+- (void)setHidden:(BOOL)hidden
+{
+    RUINViewTarget *target = &gViewTargets[RUINViewLINE14LADgBannerContainer];
+    IMP original = (IMP)&%orig;
+    if (original) atomic_store_explicit(&target->setHidden.original, original, memory_order_release);
+    RUINForceHidden(target, self, _cmd, hidden);
+}
+- (void)didMoveToWindow
+{
+    RUINViewTarget *target = &gViewTargets[RUINViewLINE14LADgBannerContainer];
+    IMP original = (IMP)&%orig;
+    if (original) atomic_store_explicit(&target->didMoveToWindow.original, original, memory_order_release);
+    RUINViewDidMoveToWindow(target, self, _cmd);
+}
+%end
+%end
+
+%group RUINHideLINE14LADAdView
+%hook RUINLINE14LADAdView
+- (void)setHidden:(BOOL)hidden
+{
+    RUINViewTarget *target = &gViewTargets[RUINViewLINE14LADAdView];
+    IMP original = (IMP)&%orig;
+    if (original) atomic_store_explicit(&target->setHidden.original, original, memory_order_release);
+    RUINForceHidden(target, self, _cmd, hidden);
+}
+- (void)didMoveToWindow
+{
+    RUINViewTarget *target = &gViewTargets[RUINViewLINE14LADAdView];
+    IMP original = (IMP)&%orig;
+    if (original) atomic_store_explicit(&target->didMoveToWindow.original, original, memory_order_release);
+    RUINViewDidMoveToWindow(target, self, _cmd);
+}
+%end
+%end
+
+%group RUINHideLINE14SmartChView
+%hook RUINLINE14SmartChView
+- (void)setHidden:(BOOL)hidden
+{
+    RUINViewTarget *target = &gViewTargets[RUINViewLINE14SmartChView];
+    IMP original = (IMP)&%orig;
+    if (original) atomic_store_explicit(&target->setHidden.original, original, memory_order_release);
+    RUINForceHidden(target, self, _cmd, hidden);
+}
+- (void)didMoveToWindow
+{
+    RUINViewTarget *target = &gViewTargets[RUINViewLINE14SmartChView];
+    IMP original = (IMP)&%orig;
+    if (original) atomic_store_explicit(&target->didMoveToWindow.original, original, memory_order_release);
+    RUINViewDidMoveToWindow(target, self, _cmd);
+    RUINLINE14ScheduleSmartChProbe((UIView *)self);
 }
 %end
 %end
@@ -1698,6 +1806,26 @@ static void RUINInstallViewTargetHooks(RUINViewTargetIndex index, RUINViewTarget
     BOOL movedReady = RUINPrepareMethodHook(target->cls, &target->didMoveToWindow);
     if (!hiddenReady || !movedReady) return;
     switch (index) {
+        case RUINViewLINE14LANBannerTableViewCell: {
+            %init(RUINHideLINE14LANBannerTableViewCell, RUINLINE14LANBannerTableViewCell = target->cls);
+            break;
+        }
+        case RUINViewLINE14LANBannerContainer: {
+            %init(RUINHideLINE14LANBannerContainer, RUINLINE14LANBannerContainer = target->cls);
+            break;
+        }
+        case RUINViewLINE14LADgBannerContainer: {
+            %init(RUINHideLINE14LADgBannerContainer, RUINLINE14LADgBannerContainer = target->cls);
+            break;
+        }
+        case RUINViewLINE14LADAdView: {
+            %init(RUINHideLINE14LADAdView, RUINLINE14LADAdView = target->cls);
+            break;
+        }
+        case RUINViewLINE14SmartChView: {
+            %init(RUINHideLINE14SmartChView, RUINLINE14SmartChView = target->cls);
+            break;
+        }
         case RUINViewLADHomeBannerContainer: {
             %init(RUINHideLADHomeBannerContainer, RUINLADHomeBannerContainer = target->cls);
             break;
@@ -1934,7 +2062,9 @@ static BOOL RUINShouldHideView(RUINViewTarget *target, id view)
     // This helper reports the live value's type, not immutable field metadata.
     // Preserve both checks when native composer objects are reused.
     atomic_fetch_add(&gVoiceTypeReflections, 1);
-    if (![RUINCopySwiftFieldTypeName(view, "kind") isEqualToString:@"LineMessagingUIV2.ChatInputBarButtonKind"])
+    NSString *kindType = RUINCopySwiftFieldTypeName(view, "kind");
+    if (![kindType isEqualToString:@"LineMessagingUIV2.ChatInputBarButtonKind"] &&
+        ![kindType isEqualToString:@"LineMessagingUI.ChatInputBarButtonKind"]) // LINE 14.6.3
         return NO;
     return [RUINCopySwiftEnumCaseName(view, "kind") isEqualToString:@"audio"];
 }
@@ -2644,6 +2774,121 @@ static NSString *RUINGroupStatus(RUINHideGroup group, BOOL enabled)
     return @"missing_verified_targets";
 }
 
+// ---- LINE 14.6.3 port: SmartChannel layout probe (read-only diagnostics) ----
+// Records which stored fields/ivars of the chat-list controllers relate to the
+// SmartChannel slot, plus sibling scroll-view insets, so the reserved top gap
+// can later be removed through LINE's own layout inputs instead of fighting
+// UITableView inset writes (which recursed through numberOfRowsInSection:).
+static NSDictionary *gLINE14SmartChProbe;
+static NSUInteger gLINE14SmartChProbeRuns;
+
+static BOOL RUINLINE14ProbeKeyword(NSString *name)
+{
+    NSString *lower = name.lowercaseString;
+    for (NSString *key in @[@"smart", @"banner", @"height", @"inset", @"constraint", @"search", @"top", @"header", @"offset"])
+        if ([lower containsString:key]) return YES;
+    return NO;
+}
+
+static NSArray *RUINLINE14ProbeFields(id object)
+{
+    NSMutableArray *rows = [NSMutableArray array];
+    NSArray *info = RUINCopySwiftFieldInfo(object, NULL);
+    for (NSDictionary *field in info) {
+        NSString *name = field[@"name"], *type = field[@"type"];
+        if (![name isKindOfClass:NSString.class] || !RUINLINE14ProbeKeyword(name)) continue;
+        NSMutableDictionary *row = [NSMutableDictionary dictionaryWithObjectsAndKeys:name, @"name",
+            [type isKindOfClass:NSString.class] ? type : @"", @"type", nil];
+        if ([type hasSuffix:@".CGFloat"] || [type isEqual:@"Swift.Double"] ||
+            [type isEqual:@"Swift.Bool"] || [type isEqual:@"Swift.Int"]) {
+            id value = RUINCopySwiftField(object, name.UTF8String);
+            if ([value isKindOfClass:NSNumber.class]) row[@"value"] = value;
+        }
+        [rows addObject:row];
+        if (rows.count >= 80) break;
+    }
+    return rows;
+}
+
+static NSArray *RUINLINE14ProbeIvars(Class cls)
+{
+    NSMutableArray *rows = [NSMutableArray array];
+    unsigned int count = 0;
+    Ivar *ivars = cls ? class_copyIvarList(cls, &count) : NULL;
+    for (unsigned int i = 0; i < count; i++) {
+        const char *name = ivar_getName(ivars[i]);
+        if (!name || !RUINLINE14ProbeKeyword(@(name))) continue;
+        const char *type = ivar_getTypeEncoding(ivars[i]);
+        [rows addObject:@{@"name": @(name), @"offset": @(ivar_getOffset(ivars[i])), @"type": type ? @(type) : @""}];
+    }
+    free(ivars);
+    return rows;
+}
+
+static NSDictionary *RUINLINE14ProbeView(UIView *view)
+{
+    NSMutableDictionary *row = [NSMutableDictionary dictionaryWithDictionary:@{
+        @"class": NSStringFromClass(object_getClass(view)), @"frame": NSStringFromCGRect(view.frame),
+        @"hidden": @(view.hidden), @"alpha": @(view.alpha)}];
+    if ([view isKindOfClass:UIScrollView.class]) {
+        UIScrollView *scroll = (UIScrollView *)view;
+        row[@"contentInset"] = NSStringFromUIEdgeInsets(scroll.contentInset);
+        row[@"adjustedContentInset"] = NSStringFromUIEdgeInsets(scroll.adjustedContentInset);
+        row[@"indicatorInsets"] = NSStringFromUIEdgeInsets(scroll.verticalScrollIndicatorInsets);
+        row[@"contentOffset"] = NSStringFromCGPoint(scroll.contentOffset);
+        row[@"adjustmentBehavior"] = @(scroll.contentInsetAdjustmentBehavior);
+    }
+    return row;
+}
+
+static void RUINLINE14RunSmartChProbe(UIView *view)
+{
+    if (!view || !NSThread.isMainThread) return;
+    NSMutableDictionary *probe = [NSMutableDictionary dictionary];
+    probe[@"run"] = @(gLINE14SmartChProbeRuns);
+    probe[@"view"] = RUINLINE14ProbeView(view);
+    probe[@"superview"] = view.superview ? NSStringFromClass(object_getClass(view.superview)) : @"nil";
+    probe[@"viewFields"] = RUINLINE14ProbeFields(view);
+    probe[@"viewIvars"] = RUINLINE14ProbeIvars(object_getClass(view));
+    NSMutableArray *constraints = [NSMutableArray array];
+    for (NSArray *list in @[view.constraints, view.superview.constraints ?: @[]]) {
+        for (NSLayoutConstraint *c in list) {
+            if (c.firstItem != view && c.secondItem != view) continue;
+            [constraints addObject:[NSString stringWithFormat:@"%@.a%ld r%ld %@.a%ld c=%.1f p=%.0f act=%d",
+                NSStringFromClass(object_getClass(c.firstItem)), (long)c.firstAttribute, (long)c.relation,
+                c.secondItem ? NSStringFromClass(object_getClass(c.secondItem)) : @"nil", (long)c.secondAttribute,
+                c.constant, c.priority, c.active]];
+        }
+    }
+    probe[@"constraints"] = constraints;
+    NSMutableArray *siblings = [NSMutableArray array];
+    for (UIView *sibling in view.superview.subviews) [siblings addObject:RUINLINE14ProbeView(sibling)];
+    probe[@"siblings"] = siblings;
+    UIResponder *responder = view;
+    UIViewController *controller = nil;
+    while (responder && !controller) {
+        if ([responder isKindOfClass:UIViewController.class]) controller = (UIViewController *)responder;
+        responder = responder.nextResponder;
+    }
+    NSMutableArray *controllers = [NSMutableArray array];
+    for (NSUInteger depth = 0; controller && depth < 5; depth++, controller = controller.parentViewController) {
+        [controllers addObject:@{@"class": NSStringFromClass(object_getClass(controller)),
+            @"fields": RUINLINE14ProbeFields(controller), @"ivars": RUINLINE14ProbeIvars(object_getClass(controller))}];
+    }
+    probe[@"controllers"] = controllers;
+    gLINE14SmartChProbe = probe;
+}
+
+static void RUINLINE14ScheduleSmartChProbe(UIView *view)
+{
+    if (!NSThread.isMainThread || !view.window || gLINE14SmartChProbeRuns >= 3) return;
+    gLINE14SmartChProbeRuns++;
+    __weak UIView *weakView = view;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        @try { RUINLINE14RunSmartChProbe(weakView); } @catch (__unused id error) {}
+    });
+}
+
 NSDictionary *RUINInterfaceDiagnostics(void)
 {
     BOOL installedForTarget = atomic_load(&gTargetMatches);
@@ -2697,7 +2942,8 @@ NSDictionary *RUINInterfaceDiagnostics(void)
             @"talkTopBannerCollapses": @(atomic_load(&gTalkTopBannerCollapses)),
             @"talkInsetHook": RUINTargetStatusName(atomic_load(&gTalkInsetStatus)),
             @"talkInsetProjections": @(atomic_load(&gTalkInsetProjections)),
-            @"talkInsetViews": RUINTalkInsetDiagnostics()
+            @"talkInsetViews": RUINTalkInsetDiagnostics(),
+            @"line14SmartChProbe": gLINE14SmartChProbe ?: (id)NSNull.null
         },
         @"recommendations": @{
             @"status": RUINGroupStatus(RUINHideGroupRecommendations, recommendations),
