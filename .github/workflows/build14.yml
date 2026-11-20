@@ -1,0 +1,41 @@
+name: Build RUIN (LINE 14.6.3 / iOS 15)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build arm64+arm64e dylib (iOS 15 target)
+        run: |
+          set -o pipefail
+          make -j4 all RUIN_BUILD_VERSION="$(tr -d '[:space:]' < VERSION)" 2>&1 | tee build.log
+
+      - name: Show availability / compile errors
+        if: failure()
+        run: grep -nE 'error:|is only available on iOS' build.log | head -200 || true
+
+      - name: Verify dylib
+        run: |
+          set -euo pipefail
+          lipo build/RUIN.dylib -archs
+          otool -l build/RUIN.dylib | grep -A3 -E 'LC_BUILD_VERSION|LC_VERSION_MIN' | head -20
+          otool -L build/RUIN.dylib
+          ! otool -L build/RUIN.dylib | grep -Ei 'substrate|ellekit|libhooker'
+          cp build/RUIN.dylib RUIN.dylib
+
+      - name: Upload dylib to draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v$(tr -d '[:space:]' < VERSION)"
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --draft --title "$tag" --notes "LINE 14.6.3 port build ${GITHUB_SHA::7}"
+          gh release upload "$tag" RUIN.dylib --clobber

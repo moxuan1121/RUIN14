@@ -1,9 +1,7 @@
 name: Release RUIN
 
 on:
-  workflow_dispatch:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:  # disabled in LINE14 port; use build14.yml
 
 permissions:
   contents: read

@@ -7,6 +7,9 @@ export RUIN_TEST_RESOURCE_BUNDLE := $(CURDIR)/resources/RUINResources.bundle
 HOST_WARNINGS := -Wall -Wextra -Werror
 RUIN_BUILD_VERSION ?= $(shell cat VERSION)
 RUIN_DEBUG ?= 0
+# LINE 14.6.3 port: target iOS 15 devices (upstream requires iOS 18).
+RUIN_MIN_IOS ?= 15.0
+RUIN_AVAILABILITY_FLAGS ?= -Werror=unguarded-availability-new -Werror=unguarded-availability
 HEADER_DIRS := $(sort $(dir $(wildcard src/*/*.h))) vendor/fishhook
 CPPFLAGS := $(addprefix -I,$(HEADER_DIRS)) $(addprefix -Ibuild/logos/,$(filter src/%,$(HEADER_DIRS))) -Ibuild/generated
 RESOURCE_BUNDLE := resources/RUINResources.bundle
@@ -24,7 +27,7 @@ LOGOS_DEPS := $(wildcard \
 	vendor/logos/bin/lib/Logos/Patch/Source/*.pm)
 # Host fixtures compile the same generated hooks as the iOS dylib.
 source = $(if $(filter $(1:.m=.x),$(LOGOS_SOURCES)),build/logos/$(1),$(1))
-CFLAGS = -isysroot $(SDK) -miphoneos-version-min=18.0 -fobjc-arc -fblocks -Wall -Wextra -O2 \
+CFLAGS = -isysroot $(SDK) -miphoneos-version-min=$(RUIN_MIN_IOS) $(RUIN_AVAILABILITY_FLAGS) -fobjc-arc -fblocks -Wall -Wextra -O2 \
 	-DRUIN_BUILD_VERSION='@"$(RUIN_BUILD_VERSION)"'
 ifeq ($(RUIN_DEBUG),1)
 CFLAGS += -DRUIN_DEBUG=1
@@ -414,14 +417,14 @@ build/$(1)/%.o: %.m $(wildcard src/*/*.h) vendor/fishhook/fishhook.h VERSION
 
 build/$(1)/fishhook.o: vendor/fishhook/fishhook.c vendor/fishhook/fishhook.h
 	mkdir -p $$(@D)
-	$$(CC) -arch $(1) -isysroot $$(SDK) -miphoneos-version-min=18.0 -O2 -c $$< -o $$@
+	$$(CC) -arch $(1) -isysroot $$(SDK) -miphoneos-version-min=$(RUIN_MIN_IOS) -O2 -c $$< -o $$@
 
 build/$(1)/SwiftFields.o: $$(SWIFT_SOURCES) src/core/SwiftFields.h
 	mkdir -p $$(@D)
-	xcrun --sdk iphoneos swiftc -sdk $$(SDK) -target $(1)-apple-ios18.0 -parse-as-library -whole-module-optimization -O -module-name RUINRuntime -emit-object $$(SWIFT_SOURCES) -o $$@
+	xcrun --sdk iphoneos swiftc -sdk $$(SDK) -target $(1)-apple-ios$(RUIN_MIN_IOS) -parse-as-library -whole-module-optimization -O -module-name RUINRuntime -emit-object $$(SWIFT_SOURCES) -o $$@
 
 build/$(1)/RUIN.dylib: $(call arch_objects,$(1))
-	xcrun --sdk iphoneos swiftc -sdk $$(SDK) -target $(1)-apple-ios18.0 -emit-library $$^ -framework Foundation -framework UIKit -framework AVFoundation -framework CoreText -framework WebKit -framework CoreGraphics -framework Security -framework CoreData -framework ImageIO -framework UniformTypeIdentifiers -framework UserNotifications -framework QuickLook -framework Intents -lsqlite3 -lz -Xlinker -install_name -Xlinker @rpath/RUIN.dylib -o $$@
+	xcrun --sdk iphoneos swiftc -sdk $$(SDK) -target $(1)-apple-ios$(RUIN_MIN_IOS) -emit-library $$^ -framework Foundation -framework UIKit -framework AVFoundation -framework CoreText -framework WebKit -framework CoreGraphics -framework Security -framework CoreData -framework ImageIO -framework UniformTypeIdentifiers -framework UserNotifications -framework QuickLook -framework Intents -lsqlite3 -lz -Xlinker -install_name -Xlinker @rpath/RUIN.dylib -o $$@
 endef
 
 $(foreach arch,$(RUIN_ARCHS),$(eval $(call RUIN_ARCH_RULES,$(arch))))
