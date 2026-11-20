@@ -795,7 +795,7 @@ static void RUINInspectShopImages(UIView *view, NSURL *directory, NSUInteger dep
     if (!view || view.hidden || depth > kMaxViewDepth) return;
     if ([view isKindOfClass:WKWebView.class]) {
         WKWebView *web = (WKWebView *)view;
-        web.inspectable = YES;
+        if (@available(iOS 16.4, *)) web.inspectable = YES;
         NSString *host = web.URL.host.lowercaseString ?: @"";
         NSDictionary *origin = @{@"scheme": web.URL.scheme ?: @"", @"host":host,
             @"path": [web.URL.scheme.lowercaseString isEqual:@"https"] ? (web.URL.path ?: @"") : @""};

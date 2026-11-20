@@ -17,7 +17,7 @@ jobs:
       - name: Build arm64+arm64e dylib (iOS 15 target)
         run: |
           set -o pipefail
-          make -j4 all RUIN_BUILD_VERSION="$(tr -d '[:space:]' < VERSION)" 2>&1 | tee build.log
+          make -k -j4 all RUIN_BUILD_VERSION="$(tr -d '[:space:]' < VERSION)" 2>&1 | tee build.log
 
       - name: Show availability / compile errors
         if: failure()
