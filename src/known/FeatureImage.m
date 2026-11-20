@@ -1,6 +1,8 @@
 #import "FeatureImage.h"
+#import "../core/StartupProfiler.h"
 #import <dlfcn.h>
 #import <objc/runtime.h>
+#import <os/lock.h>
 #import <mach-o/dyld.h>
 #import <mach-o/dyld_images.h>
 #import <mach/mach.h>
@@ -129,13 +131,18 @@ BOOL RUINResolveFeatureImageFromCandidates(const RUINHostIdentity *host,
     size_t count, RUINFeatureImage *result) {
     if (!result) return NO;
     memset(result, 0, sizeof(*result));
+    RUIN_PROFILE_BEGIN("resolve.fc_paths");
     char *canonicalBundle = CanonicalPath(bundleExecutable);
-    if (!host || !ownerHeader || !MatchesCanonicalPath(bundleExecutable, canonicalBundle, ownerExecutable) ||
-        (!candidates && count) || count > UINT32_MAX) {
+    BOOL pathsValid = host && ownerHeader &&
+        MatchesCanonicalPath(bundleExecutable, canonicalBundle, ownerExecutable) &&
+        (candidates || !count) && count <= UINT32_MAX;
+    RUIN_PROFILE_END(pathsValid ? RUINProfileStatusOK : RUINProfileStatusFailed);
+    if (!pathsValid) {
         free(canonicalBundle);
         return NO;
     }
     BOOL found = NO, sameProcessPath = MatchesCanonicalPath(bundleExecutable, canonicalBundle, processExecutable);
+    RUIN_PROFILE_BEGIN("resolve.fc_scan");
     for (size_t i = 0; i < count; i++) {
         const RUINDyldImageCandidate *candidate = &candidates[i];
         if (!MatchesCanonicalPath(bundleExecutable, canonicalBundle, candidate->imageName)) continue;
@@ -162,10 +169,12 @@ BOOL RUINResolveFeatureImageFromCandidates(const RUINHostIdentity *host,
     }
     if (found) {
         free(canonicalBundle);
+        RUIN_PROFILE_END(RUINProfileStatusOK);
         return YES;
     }
 reject:
     free(canonicalBundle);
+    RUIN_PROFILE_END(RUINProfileStatusFailed);
     memset(result, 0, sizeof(*result));
     return NO;
 }
@@ -253,6 +262,136 @@ BOOL RUINResolveNativeFeatureImage(const RUINHostIdentity *host, RUINFeatureImag
     return YES;
 }
 
+// Shared converted-image resolution cache. A successful full resolution is
+// expensive (a guarded snapshot of every dyld image plus per-candidate path
+// canonicalization), and several features resolve the same host image during
+// startup. Only the discovery result is cached: a hit takes the same guarded
+// name/header snapshot as the full path (never per-candidate canonicalization
+// or command copies for non-matching images), confirms the stored image is
+// still present at its index and unambiguous, then revalidates it through
+// RUINResolveFeatureImageFromCandidates, so path identity, UUID/CPU/filetype/
+// conversion shape, slide consistency and the lifetime proof are rechecked on
+// every use. The cache holds no loader pin of its own: the caller's NOLOAD
+// reference (obtained once per resolution) is the only lifetime proof, and a
+// stale entry simply fails the live snapshot comparison. Failures are never
+// cached, so an early-initialization miss stays retryable.
+typedef NS_ENUM(NSInteger, RUINFeatureImageCacheOutcome) {
+    RUINFeatureImageCacheMiss = 0,
+    RUINFeatureImageCacheHit,
+    RUINFeatureImageCacheLifetimeRejected,
+};
+
+static os_unfair_lock resolvedImageCacheLock = OS_UNFAIR_LOCK_INIT;
+static BOOL resolvedImageCacheFilled;
+static RUINFeatureImage resolvedImageCache;
+static uint8_t resolvedImageCacheUUID[16];
+static char *resolvedImageCacheName;
+
+static BOOL CopyHostUUID(const RUINHostIdentity *host, uuid_t output) {
+    if (!host || !host->uuid) return NO;
+    NSUUID *identity = [[NSUUID alloc] initWithUUIDString:@(host->uuid)];
+    if (!identity) return NO;
+    [identity getUUIDBytes:output];
+    return YES;
+}
+
+static const char *PathBasename(const char *path) {
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+// `reference` is owned by the caller and is never closed here. On a miss the
+// caller continues with full resolution using the same reference.
+static RUINFeatureImageCacheOutcome RUINResolveFeatureImageFromCache(const RUINHostIdentity *host,
+    const char *bundle, const char *ownerPath, void *reference, RUINFeatureImage *result) {
+    uuid_t expected;
+    if (!CopyHostUUID(host, expected)) return RUINFeatureImageCacheMiss;
+    RUINFeatureImage cached = {0};
+    char *cachedName = NULL;
+    os_unfair_lock_lock(&resolvedImageCacheLock);
+    if (resolvedImageCacheFilled && !memcmp(resolvedImageCacheUUID, expected, 16)) {
+        cached = resolvedImageCache;
+        cachedName = resolvedImageCacheName ? strdup(resolvedImageCacheName) : NULL;
+    }
+    os_unfair_lock_unlock(&resolvedImageCacheLock);
+    if (!cachedName) return RUINFeatureImageCacheMiss;
+    RUIN_PROFILE_BEGIN("resolve.cache");
+    RUINFeatureImageCacheOutcome outcome = RUINFeatureImageCacheMiss;
+    uint64_t generation = atomic_load_explicit(&imageGeneration, memory_order_acquire);
+    uint32_t count = _dyld_image_count();
+    RUINDyldImageCandidate *candidates = count ? calloc(count, sizeof(*candidates)) : NULL;
+    BOOL complete = candidates != NULL;
+    for (uint32_t i = 0; complete && i < count; i++) {
+        candidates[i] = (RUINDyldImageCandidate){
+            .header=(const void *)_dyld_get_image_header(i), .slide=_dyld_get_image_vmaddr_slide(i),
+            .imageName=CopyImageName(_dyld_get_image_name(i))};
+        if (!candidates[i].imageName) complete = NO;
+    }
+    BOOL stable = complete && count == _dyld_image_count() &&
+        generation == atomic_load_explicit(&imageGeneration, memory_order_acquire);
+    uint32_t index = cached.image.imageIndex;
+    char *canonicalCached = stable ? CanonicalPath(cachedName) : NULL;
+    if (canonicalCached && index < count && candidates[index].header == (const void *)cached.image.header &&
+        candidates[index].slide == cached.image.slide &&
+        !strcmp(candidates[index].imageName, cachedName) &&
+        MatchesCanonicalPath(cachedName, canonicalCached, ownerPath)) {
+        // Ambiguity spot-check: no other image may share the stored path
+        // (byte-identical, or canonically equal when the final component
+        // matches) under a different header; same-header entries are dyld
+        // index aliases of one image.
+        const char *cachedBase = PathBasename(cachedName);
+        BOOL unambiguous = YES;
+        for (uint32_t i = 0; unambiguous && i < count; i++) {
+            if (i == index || candidates[i].header == (const void *)cached.image.header) continue;
+            const char *name = candidates[i].imageName;
+            if (!strcmp(name, cachedName) || (!strcmp(PathBasename(name), cachedBase) &&
+                MatchesCanonicalPath(cachedName, canonicalCached, name))) unambiguous = NO;
+        }
+        char *process = unambiguous ? CopyProcessExecutablePath() : NULL;
+        if (process) {
+            RUINDyldImageCandidate candidate = {.header=cached.image.header,
+                .slide=cached.image.slide, .imageName=cachedName};
+            if (RUINResolveFeatureImageFromCandidates(host, bundle, process,
+                    ownerPath, cached.image.header, &candidate, 1, result)) {
+                result->image.imageIndex = index;
+                // Same lifetime rule as the full path. The candidate is the
+                // proven owner image, so a rescan cannot reach another verdict.
+                if (!reference && (result->convertedExecutable || !IsProcessMain(result->image.header)))
+                    outcome = RUINFeatureImageCacheLifetimeRejected;
+                else {
+                    result->loaderReference = reference;
+                    outcome = RUINFeatureImageCacheHit;
+                }
+            }
+        }
+        free(process);
+    }
+    free(canonicalCached);
+    for (uint32_t i = 0; i < count && candidates; i++) free((void *)candidates[i].imageName);
+    free(candidates);
+    free(cachedName);
+    if (outcome != RUINFeatureImageCacheHit) memset(result, 0, sizeof(*result));
+    RUIN_PROFILE_END(outcome == RUINFeatureImageCacheHit ? RUINProfileStatusOK : RUINProfileStatusFailed);
+    return outcome;
+}
+
+static void RUINCacheResolvedFeatureImage(const RUINHostIdentity *host,
+    const RUINFeatureImage *image, const char *imageName) {
+    uuid_t expected;
+    if (!imageName || !CopyHostUUID(host, expected)) return;
+    char *nameCopy = strdup(imageName);
+    if (!nameCopy) return;
+    os_unfair_lock_lock(&resolvedImageCacheLock);
+    char *previous = resolvedImageCacheName;
+    resolvedImageCache = *image;
+    resolvedImageCache.loaderReference = NULL; // Callers own their pins.
+    memcpy(resolvedImageCacheUUID, expected, 16);
+    resolvedImageCacheName = nameCopy;
+    resolvedImageCacheFilled = YES;
+    os_unfair_lock_unlock(&resolvedImageCacheLock);
+    free(previous);
+}
+
 BOOL RUINResolveFeatureImage(const RUINHostIdentity *host, Class nativeClass,
     RUINFeatureImage *result) {
     if (!result) return NO;
@@ -263,7 +402,10 @@ BOOL RUINResolveFeatureImage(const RUINHostIdentity *host, Class nativeClass,
     const char *bundle = NSBundle.mainBundle.executablePath.fileSystemRepresentation;
     atomic_store(&resolutionStatus, "nativeClassOwnerUnavailable");
     if (!bundle || !ownerPath || !SamePath(bundle, ownerPath)) return NO;
-    if (RUINResolveNativeFeatureImage(host, result)) {
+    RUIN_PROFILE_BEGIN("resolve.native");
+    BOOL native = RUINResolveNativeFeatureImage(host, result);
+    RUIN_PROFILE_END(native ? RUINProfileStatusOK : RUINProfileStatusSkipped);
+    if (native) {
         atomic_store(&resolutionStatus, "nativeProcessImage");
         return YES;
     }
@@ -272,10 +414,23 @@ BOOL RUINResolveFeatureImage(const RUINHostIdentity *host, Class nativeClass,
         _dyld_register_func_for_add_image(ImageListChanged);
         _dyld_register_func_for_remove_image(ImageListChanged);
     });
-    char *process = CopyProcessExecutablePath();
     // NOLOAD never loads a substitute. A genuine process executable may have no
     // dlopen handle; only the kernel image-list proof permits that lifetime case.
+    // The single reference serves both the cache probe and full resolution.
     void *reference = dlopen(bundle, RTLD_LAZY | RTLD_NOLOAD);
+    RUINFeatureImageCacheOutcome cacheOutcome =
+        RUINResolveFeatureImageFromCache(host, bundle, ownerPath, reference, result);
+    if (cacheOutcome == RUINFeatureImageCacheHit) {
+        atomic_store(&resolutionStatus, "resolvedCached");
+        return YES;
+    }
+    if (cacheOutcome == RUINFeatureImageCacheLifetimeRejected) {
+        if (reference) dlclose(reference);
+        atomic_store(&resolutionStatus, "imageLifetimeUnproven");
+        return NO;
+    }
+    char *process = CopyProcessExecutablePath();
+    RUIN_PROFILE_BEGIN("resolve.snapshot");
     uint64_t generation = atomic_load_explicit(&imageGeneration, memory_order_acquire);
     uint32_t count = _dyld_image_count();
     RUINDyldImageCandidate *candidates = count ? calloc(count, sizeof(*candidates)) : NULL;
@@ -291,10 +446,16 @@ BOOL RUINResolveFeatureImage(const RUINHostIdentity *host, Class nativeClass,
             ownerHeader = candidates[i].header;
     }
     free(canonicalOwner);
-    BOOL resolved = complete && count == _dyld_image_count() &&
-        generation == atomic_load_explicit(&imageGeneration, memory_order_acquire) &&
-        RUINResolveFeatureImageFromCandidates(host, bundle, process, ownerPath,
-            ownerHeader, candidates, count, result);
+    BOOL stable = complete && count == _dyld_image_count() &&
+        generation == atomic_load_explicit(&imageGeneration, memory_order_acquire);
+    RUIN_PROFILE_END(stable ? RUINProfileStatusOK : RUINProfileStatusFailed);
+    RUIN_PROFILE_BEGIN("resolve.from_candidates");
+    BOOL resolved = stable && RUINResolveFeatureImageFromCandidates(host, bundle, process, ownerPath,
+        ownerHeader, candidates, count, result);
+    RUIN_PROFILE_END(resolved ? RUINProfileStatusOK : RUINProfileStatusFailed);
+    char *resolvedName = NULL;
+    if (resolved && result->image.imageIndex < count)
+        resolvedName = strdup(candidates[result->image.imageIndex].imageName);
     for (uint32_t i = 0; i < count && candidates; i++) free((void *)candidates[i].imageName);
     free(candidates); free(process);
     atomic_store(&resolutionStatus, resolved ? "resolved" : complete ? "imageCandidateRejected" : "imageSnapshotUnavailable");
@@ -304,10 +465,13 @@ BOOL RUINResolveFeatureImage(const RUINHostIdentity *host, Class nativeClass,
     }
     if (!resolved) {
         if (reference) dlclose(reference);
+        free(resolvedName);
         memset(result, 0, sizeof(*result));
         return NO;
     }
     result->loaderReference = reference;
+    RUINCacheResolvedFeatureImage(host, result, resolvedName);
+    free(resolvedName);
     return YES;
 }
 

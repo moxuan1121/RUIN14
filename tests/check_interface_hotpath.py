@@ -136,10 +136,12 @@ static NSMutableDictionary *preferences;
 @interface FixtureDefaults : NSObject
 + (instancetype)standardUserDefaults;
 - (BOOL)boolForKey:(NSString *)key;
+- (void)registerDefaults:(NSDictionary *)registrationDictionary;
 @end
 @implementation FixtureDefaults
 + (instancetype)standardUserDefaults { return [self new]; }
 - (BOOL)boolForKey:(NSString *)key { return [preferences[key] boolValue]; }
+- (void)registerDefaults:(__unused NSDictionary *)registrationDictionary {}
 @end
 #define NSUserDefaults FixtureDefaults
 static NSString *RUINLocalizedString(NSString *key) { return key; }
@@ -174,13 +176,15 @@ static RUINViewTarget viewTarget;
 static RUINViewTarget *RUINViewTargetForObject(__unused id object) { return &viewTarget; }
 static char gOriginalHiddenStateKey;
 static unsigned gInternalHiddenUpdateDepth;
-static atomic_bool gHideAdsEnabled, gHideRecommendationsEnabled, gHideVoiceInputEnabled, gHideAgentIEnabled, gTargetMatches;
+static atomic_bool gHideAdsEnabled, gHideRecommendationsEnabled, gHideVoiceInputEnabled, gHideAgentIEnabled, gFixPanelHeightEnabled, gProfileHeaderLeftEnabled, gTargetMatches;
 static atomic_uint_fast64_t gVisibleViewScans, gVisibleViewScanSkips, gVoiceTypeReflections, gVoiceKindRestorations;
 static NSUInteger gViewHooksGeneration, walkedRoots, installAttempts;
 static NSString * const RUINHideAdsDefaultsKey = @"ads";
 static NSString * const RUINHideRecommendationsDefaultsKey = @"recommendations";
 static NSString * const RUINHideVoiceInputDefaultsKey = @"voice";
 static NSString * const RUINHideAgentIBarDefaultsKey = @"agent";
+static NSString * const RUINFixPanelHeightDefaultsKey = @"panel";
+static NSString * const RUINProfileHeaderLeftDefaultsKey = @"profileHeader";
 static BOOL targetMatches = YES, installNewHook;
 static BOOL RUINTargetMatches(void) { return targetMatches; }
 static void RUINMarkHooksVersionGated(void) {}

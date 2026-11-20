@@ -166,12 +166,14 @@ def extract(source, start, end):
 
 def main():
     ui = (THEMES / "ThemeUI.m").read_text()
+    settings_start = ui.index("@implementation RUINThemeSettingsViewController")
+    settings = ui[settings_start:ui.index("\n@end", settings_start)]
     shop = (THEMES / "ThemeShop.x").read_text()
     globals_ = extract(ui, "static NSNotificationName const RUINThemeUIDownloadChanged", "static NSString *RUINThemeUIString(")
     validation = extract(ui, "static NSError *RUINThemeUIError(", "static NSString *RUINThemeUITrim(")
-    messages = extract(ui, "- (void)showMessage:", "- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:")
-    download = extract(ui, "- (void)startDownloadWithName:", "- (CGRect)menuRect:")
-    resolve = extract(ui, "        RUINThemeSettingsViewController *owner = weakSelf;", "\n    }];\n    download.enabled = NO;")
+    messages = extract(settings, "- (void)showMessage:", "- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:")
+    download = extract(settings, "- (void)startDownloadWithName:", "- (CGRect)menuRect:")
+    resolve = extract(settings, "        RUINThemeSettingsViewController *owner = weakSelf;", "\n    }];\n    download.enabled = NO;")
     begin = '''static void BeginResolution(RUINThemeSettingsViewController *source) {
         __weak typeof(source) weakSelf = source;
         NSString *URLText = @"https://store.line.me/themeshop/product/313c6eb8-8584-4f5f-b849-b2b0c7e1c43d/ja";

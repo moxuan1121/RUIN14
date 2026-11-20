@@ -15,6 +15,11 @@
 #import <CoreData/CoreData.h>
 
 #import "Features.h"
+#if RUIN_DEBUG
+#import "Localization.h"
+#import "SecondaryLogin.h"
+#import "InterfaceFeatures.h"
+#endif
 #import "TargetMetadata.h"
 #import "LINEPrivateCalls.h"
 #import "SwiftFields.h"
@@ -904,6 +909,399 @@ void RUINRequestRuntimeSnapshot(void) {
     RUINInspectionNotification(NULL, NULL, NULL, NULL, NULL);
 }
 
+#if RUIN_DEBUG
+// User-triggered composer inspection: unlike the env-gated snapshot path this
+// runs on an explicit tap in RUIN Settings > Diagnostics, and captures the
+// views the snapshot walk skips (hidden and zero-alpha views included), so a
+// panel that LINE believes is open but never renders leaves evidence here.
+static NSDictionary *gComposerInspection;
+static NSUInteger gComposerInspectionCount;
+
+static NSArray *RUINComposerActionSummary(UIControl *control) {
+    NSMutableArray *actions = [NSMutableArray array];
+    for (id target in control.allTargets) {
+        if (actions.count >= 8) break;
+        for (NSString *selectorName in [control actionsForTarget:target forControlEvent:UIControlEventTouchUpInside]) {
+            if (actions.count >= 8) break;
+            [actions addObject:@{@"targetClass": RUINClassName(target), @"selector": selectorName}];
+        }
+    }
+    return actions;
+}
+
+static NSDictionary *RUINComposerViewRecord(UIView *view, UIView *root) {
+    NSMutableDictionary *record = [@{@"class": RUINClassName(view), @"hidden": @(view.hidden), @"alpha": @(view.alpha),
+        @"frameInWindow": NSStringFromCGRect([view convertRect:view.bounds toView:root]),
+        @"userInteractionEnabled": @(view.userInteractionEnabled)} mutableCopy];
+    if (view.gestureRecognizers.count) {
+        NSMutableArray *gestures = [NSMutableArray array];
+        for (UIGestureRecognizer *gesture in view.gestureRecognizers) {
+            if (gestures.count >= 12) break;
+            [gestures addObject:RUINClassName(gesture)];
+        }
+        record[@"gestures"] = gestures;
+    }
+    return record;
+}
+
+static void RUINComposerInspectSubtree(UIView *view, UIView *root, NSMutableArray *records, NSUInteger depth) {
+    if (depth > 6 || records.count >= 220) return;
+    [records addObject:RUINComposerViewRecord(view, root)];
+    for (UIView *child in view.subviews) RUINComposerInspectSubtree(child, root, records, depth + 1);
+}
+
+static void RUINComposerInspectView(UIView *view, UIView *root, NSMutableDictionary *state, NSUInteger depth) {
+    if (depth > 40) return;
+    NSString *className = RUINClassName(view);
+    NSMutableArray *buttons = state[@"buttons"], *panels = state[@"panels"], *bars = state[@"bars"];
+    NSMutableArray *skeleton = state[@"skeleton"];
+    if ([view isFirstResponder] && !state[@"firstResponder"]) {
+        NSDictionary *responder = nil;
+        if ([view respondsToSelector:@selector(inputView)] && [view respondsToSelector:@selector(inputAccessoryView)]) {
+            UIView *inputView = [(UITextField *)view inputView];
+            UIView *accessory = [(UITextField *)view inputAccessoryView];
+            responder = @{@"class": className,
+                @"inputView": inputView ? @{@"class": RUINClassName(inputView),
+                    @"frameInWindow": NSStringFromCGRect([inputView convertRect:inputView.bounds toView:root])} : (id)NSNull.null,
+                @"inputAccessoryView": accessory ? @{@"class": RUINClassName(accessory),
+                    @"frameInWindow": NSStringFromCGRect([accessory convertRect:accessory.bounds toView:root])} : (id)NSNull.null};
+        } else {
+            responder = @{@"class": className};
+        }
+        state[@"firstResponder"] = responder;
+    }
+    if (skeleton.count < 800) {
+        [skeleton addObject:RUINComposerViewRecord(view, root)];
+        if ([view isKindOfClass:UITableViewCell.class] || [view isKindOfClass:UICollectionViewCell.class]) return;
+    }
+    if ([className containsString:@"ChatTopBottomContainerView"] &&
+        [className containsString:@"ChatBottomViewID"] && !state[@"containerObject"])
+        state[@"containerObject"] = view;
+    if ([className containsString:@"WelcomeView"] && !state[@"welcomeRoot"])
+        state[@"welcomeRoot"] = root;
+    if ([className isEqualToString:@"LineMessagingUI.ChatInputBarButton"]) {
+        if (buttons.count < 32) {
+            NSMutableDictionary *record = [RUINComposerViewRecord(view, root) mutableCopy];
+            record[@"kindType"] = RUINCopySwiftFieldTypeName(view, "kind") ?: @"missing";
+            record[@"kind"] = RUINCopySwiftEnumCaseName(view, "kind") ?: @"unresolved";
+            record[@"enabled"] = @([(UIControl *)view isEnabled]);
+            record[@"superview"] = view.superview ? RUINClassName(view.superview) : @"none";
+            record[@"actions"] = RUINComposerActionSummary((UIControl *)view);
+            [buttons addObject:record];
+        }
+    } else if ([className isEqualToString:@"LineMessagingUI.ChatInputBar"]) {
+        if (!state[@"barObject"]) state[@"barObject"] = view;
+        if (bars.count < 4) {
+            NSMutableArray *subtree = [NSMutableArray array];
+            RUINComposerInspectSubtree(view, root, subtree, 0);
+            NSMutableDictionary *record = [RUINComposerViewRecord(view, root) mutableCopy];
+            record[@"subtree"] = subtree;
+            [bars addObject:record];
+        }
+    } else if (panels.count < 96 &&
+               ([className containsString:@"Board"] || [className containsString:@"Picker"] ||
+                [className containsString:@"Panel"] || [className containsString:@"Sticker"] ||
+                [className containsString:@"Stamp"] || [className containsString:@"Emoji"] ||
+                [className containsString:@"Keyboard"] || [className containsString:@"InputBar"] ||
+                [className containsString:@"MenuView"])) {
+        NSMutableArray *chain = [NSMutableArray array];
+        for (UIView *ancestor = view.superview; ancestor && chain.count < 12; ancestor = ancestor.superview)
+            [chain addObject:RUINClassName(ancestor)];
+        NSMutableArray *children = [NSMutableArray array];
+        for (UIView *child in view.subviews) {
+            if (children.count >= 24) break;
+            [children addObject:RUINClassName(child)];
+        }
+        NSMutableDictionary *record = [RUINComposerViewRecord(view, root) mutableCopy];
+        record[@"bounds"] = NSStringFromCGRect(view.bounds);
+        record[@"clipsToBounds"] = @(view.clipsToBounds);
+        record[@"subviews"] = @(view.subviews.count);
+        record[@"childrenClasses"] = children;
+        record[@"superviewChain"] = chain;
+        [panels addObject:record];
+    }
+    for (UIView *child in view.subviews) RUINComposerInspectView(child, root, state, depth + 1);
+}
+
+static NSDictionary *RUINComposerFieldDump(id object) {
+    if (!object) return @{};
+    NSMutableArray *fields = [NSMutableArray array];
+    NSArray<NSString *> *names = RUINCopySwiftFieldNames(object) ?: @[];
+    NSUInteger limit = MIN(names.count, (NSUInteger)80);
+    for (NSUInteger i = 0; i < limit; i++) {
+        NSString *name = names[i];
+        NSString *type = RUINCopySwiftFieldTypeName(object, name.UTF8String) ?: @"";
+        NSMutableDictionary *row = [@{@"name": name, @"type": type} mutableCopy];
+        NSString *enumCase = RUINCopySwiftEnumCaseName(object, name.UTF8String);
+        if (enumCase) row[@"value"] = enumCase;
+        else if ([type containsString:@"Bool"] || [type containsString:@"Int"] ||
+                 [type containsString:@"Double"] || [type containsString:@"Float"] ||
+                 [type containsString:@"CGFloat"]) {
+            id value = RUINCopySwiftField(object, name.UTF8String);
+            if ([value isKindOfClass:NSNumber.class]) row[@"value"] = value;
+            else if (value) row[@"value"] = @"object";
+        }
+        [fields addObject:row];
+    }
+    return @{@"class": RUINClassName(object), @"fields": fields};
+}
+
+static void RUINComposerCollectControllers(UIViewController *controller, NSMutableArray *queue,
+                                           NSMutableSet *seen, NSMutableArray *detachedRoots) {
+    if (!controller || [seen containsObject:controller]) return;
+    [seen addObject:controller];
+    [queue addObject:controller];
+    UIView *view = controller.viewIfLoaded;
+    if (view && !view.window && !view.superview && detachedRoots.count < 12)
+        [detachedRoots addObject:controller];
+    for (NSUInteger i = 0; i < queue.count; i++) {
+        UIViewController *current = queue[i];
+        if (current.presentedViewController)
+            RUINComposerCollectControllers(current.presentedViewController, queue, seen, detachedRoots);
+        for (UIViewController *child in current.childViewControllers)
+            RUINComposerCollectControllers(child, queue, seen, detachedRoots);
+    }
+}
+
+static void RUINComposerDumpAXElement(id element, NSMutableArray *rows, NSHashTable *visited,
+                                      NSUInteger depth, NSUInteger *budget) {
+    if (!element || [visited containsObject:element]) return;
+    if (!*budget || depth > 16) return;
+    (*budget)--;
+    [visited addObject:element];
+    if ([element isKindOfClass:NSObject.class]) {
+        NSObject *object = (NSObject *)element;
+        NSString *identifier = [object respondsToSelector:@selector(accessibilityIdentifier)] ?
+            [(id<UIAccessibilityIdentification>)object accessibilityIdentifier] : nil;
+        if (identifier.length || (object.accessibilityTraits & UIAccessibilityTraitButton)) {
+            NSMutableDictionary *row = [@{@"class": RUINClassName(object),
+                @"identifier": identifier ?: @"",
+                @"isButton": @((object.accessibilityTraits & UIAccessibilityTraitButton) != 0),
+                @"notEnabled": @((object.accessibilityTraits & UIAccessibilityTraitNotEnabled) != 0),
+                @"frame": NSStringFromCGRect(object.accessibilityFrame)} mutableCopy];
+            NSString *label = object.accessibilityLabel;
+            if (label.length) row[@"label"] = label.length > 40 ? [label substringToIndex:40] : label;
+            [rows addObject:row];
+        }
+        if ([object respondsToSelector:@selector(accessibilityElements)]) {
+            NSArray *children = [(id)object accessibilityElements];
+            if ([children isKindOfClass:NSArray.class])
+                for (id child in children) RUINComposerDumpAXElement(child, rows, visited, depth + 1, budget);
+        }
+    }
+    if ([element isKindOfClass:UIView.class])
+        for (UIView *child in [(UIView *)element subviews])
+            RUINComposerDumpAXElement(child, rows, visited, depth + 1, budget);
+}
+
+void RUINRunUIExtraction(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ RUINRunUIExtraction(); });
+        return;
+    }
+    if (!RUINInspectorTargetMatches()) { gComposerInspection = @{@"status": @"version_gated"}; return; }
+    NSMutableArray *hierarchies = [NSMutableArray array];
+    NSMutableArray *windowClasses = [NSMutableArray array];
+    NSMutableArray *detachedRoots = [NSMutableArray array];
+    NSMutableSet *seenControllers = [NSMutableSet set];
+    BOOL keyboardWindowPresent = NO;
+    id firstResponder = NSNull.null;
+    UIView *foundBar = nil;
+    UIView *foundContainer = nil;
+    UIView *foundWelcomeRoot = nil;
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:UIWindowScene.class] ||
+            scene.activationState != UISceneActivationStateForegroundActive) continue;
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            NSString *windowClass = RUINClassName(window);
+            [windowClasses addObject:windowClass];
+            if ([windowClass containsString:@"Keyboard"]) keyboardWindowPresent = YES;
+            NSMutableDictionary *state = [@{@"buttons": [NSMutableArray array], @"panels": [NSMutableArray array],
+                @"bars": [NSMutableArray array], @"skeleton": [NSMutableArray array]} mutableCopy];
+            RUINComposerInspectView(window, window, state, 0);
+            if (state[@"firstResponder"]) firstResponder = state[@"firstResponder"];
+            if (!foundBar) foundBar = state[@"barObject"];
+            if (!foundContainer) foundContainer = state[@"containerObject"];
+            if (!foundWelcomeRoot) foundWelcomeRoot = state[@"welcomeRoot"];
+            [hierarchies addObject:@{@"root": [@"window:" stringByAppendingString:windowClass],
+                @"inputBarButtons": state[@"buttons"], @"inputBars": state[@"bars"],
+                @"panelCandidates": state[@"panels"], @"viewSkeleton": state[@"skeleton"]}];
+            NSMutableArray *queue = [NSMutableArray array];
+            RUINComposerCollectControllers(window.rootViewController, queue, seenControllers, detachedRoots);
+        }
+    }
+    // Chat view controllers live in another tab's navigation stack: their
+    // views are detached from any window while RUIN Settings is open, so walk
+    // those hierarchies as their own roots too.
+    for (UIViewController *controller in detachedRoots) {
+        NSMutableDictionary *state = [@{@"buttons": [NSMutableArray array], @"panels": [NSMutableArray array],
+            @"bars": [NSMutableArray array], @"skeleton": [NSMutableArray array]} mutableCopy];
+        RUINComposerInspectView(controller.viewIfLoaded, controller.viewIfLoaded, state, 0);
+        [hierarchies addObject:@{@"root": [@"detached:" stringByAppendingString:RUINClassName(controller)],
+            @"inputBarButtons": state[@"buttons"], @"inputBars": state[@"bars"],
+            @"panelCandidates": state[@"panels"], @"viewSkeleton": state[@"skeleton"]}];
+    }
+    NSMutableDictionary *chatState = [NSMutableDictionary dictionary];
+    if (foundBar) {
+        chatState[@"deviceIdiom"] = @(UIDevice.currentDevice.userInterfaceIdiom);
+        UITraitCollection *traits = foundBar.window.traitCollection;
+        if (traits) {
+            chatState[@"windowIdiom"] = @(traits.userInterfaceIdiom);
+            chatState[@"horizontalSizeClass"] = @(traits.horizontalSizeClass);
+            chatState[@"verticalSizeClass"] = @(traits.verticalSizeClass);
+        }
+        chatState[@"inputBar"] = RUINComposerFieldDump(foundBar);
+        UIResponder *responder = foundBar;
+        UIViewController *owner = nil;
+        for (NSUInteger i = 0; i < 24 && responder; i++) {
+            responder = responder.nextResponder;
+            if ([responder isKindOfClass:UIViewController.class]) { owner = (UIViewController *)responder; break; }
+        }
+        if (owner) {
+            chatState[@"chatViewController"] = RUINComposerFieldDump(owner);
+            chatState[@"chatTraitIdiom"] = @(owner.traitCollection.userInterfaceIdiom);
+        }
+        if (foundContainer) chatState[@"bottomContainer"] = RUINComposerFieldDump(foundContainer);
+    }
+    NSMutableDictionary *welcomeProbe = [NSMutableDictionary dictionary];
+    if (foundWelcomeRoot) {
+        welcomeProbe[@"found"] = @YES;
+        NSMutableArray *rows = [NSMutableArray array];
+        NSUInteger budget = 400;
+        RUINComposerDumpAXElement(foundWelcomeRoot, rows,
+            [NSHashTable hashTableWithOptions:NSPointerFunctionsObjectPointerPersonality], 0, &budget);
+        welcomeProbe[@"elements"] = rows;
+        welcomeProbe[@"budgetExhausted"] = @(budget == 0);
+    }
+    NSDictionary *info = NSBundle.mainBundle.infoDictionary;
+    gComposerInspectionCount++;
+    gComposerInspection = @{@"status": @"captured",
+        @"capturedAt": [NSISO8601DateFormatter.new stringFromDate:NSDate.date],
+        @"app": @{@"bundleIdentifier": NSBundle.mainBundle.bundleIdentifier ?: @"",
+            @"shortVersion": info[@"CFBundleShortVersionString"] ?: @"",
+            @"build": info[@"CFBundleVersion"] ?: @""},
+        @"secondaryLogin": RUINSecondaryLoginDiagnostics(),
+        @"profileHeader": RUINInterfaceDiagnostics()[@"profileHeader"] ?: @{},
+        @"welcomeProbe": welcomeProbe,
+        @"windows": windowClasses, @"keyboardWindowPresent": @(keyboardWindowPresent),
+        @"firstResponder": firstResponder, @"hierarchies": hierarchies,
+        @"chatState": chatState};
+    RUINRefreshRuntimeReport();
+}
+
+NSDictionary<NSString *, id> *RUINComposerInspectionResult(void) {
+    return gComposerInspection;
+}
+
+
+// Always-visible UI extraction button (top-right of the key window).
+// Tapping it captures the live UI at that exact moment — chat open,
+// panel state as-is — and hands the JSON to the share sheet. Nothing
+// is persisted: the result lives in memory and the share uses a
+// temporary file removed on completion.
+NSString * const RUINUIExtractButtonEnabledDefaultsKey = @"RUINDeveloperShowUIExtractButton";
+static UIButton *gUIExtractButton;
+
+static UIViewController *RUINUIExtractTopmostController(UIViewController *controller) {
+    UIViewController *top = controller;
+    while (top.presentedViewController && !top.presentedViewController.isBeingDismissed)
+        top = top.presentedViewController;
+    if ([top isKindOfClass:UINavigationController.class]) {
+        UIViewController *visible = ((UINavigationController *)top).visibleViewController;
+        if (visible && visible != top) return RUINUIExtractTopmostController(visible);
+    }
+    if ([top isKindOfClass:UITabBarController.class]) {
+        UIViewController *selected = ((UITabBarController *)top).selectedViewController;
+        if (selected && selected != top) return RUINUIExtractTopmostController(selected);
+    }
+    return top;
+}
+
+static void RUINPresentUIExtractionShare(void) {
+    NSDictionary *result = RUINComposerInspectionResult();
+    NSData *json = result ? [NSJSONSerialization dataWithJSONObject:result
+        options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:NULL] : nil;
+    UIWindow *window = gUIExtractButton.window;
+    UIViewController *top = window.rootViewController
+        ? RUINUIExtractTopmostController(window.rootViewController) : nil;
+    if (!json || !top) return;
+    NSURL *url = [NSURL fileURLWithPath:[NSTemporaryDirectory()
+        stringByAppendingPathComponent:@"RUIN-ui-extraction.json"]];
+    if (![json writeToURL:url options:NSDataWritingAtomic error:NULL]) return;
+    UIActivityViewController *share = [[UIActivityViewController alloc]
+        initWithActivityItems:@[url] applicationActivities:nil];
+    share.completionWithItemsHandler = ^(__unused UIActivityType activityType, __unused BOOL completed,
+                                         __unused NSArray *returnedItems, __unused NSError *activityError) {
+        [NSFileManager.defaultManager removeItemAtURL:url error:NULL];
+    };
+    if (share.popoverPresentationController) {
+        share.popoverPresentationController.sourceView = gUIExtractButton;
+        share.popoverPresentationController.sourceRect = gUIExtractButton.bounds;
+    }
+    [top presentViewController:share animated:YES completion:nil];
+}
+
+static void RUINAttachUIExtractButton(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ RUINAttachUIExtractButton(); });
+        return;
+    }
+    if (![NSUserDefaults.standardUserDefaults boolForKey:RUINUIExtractButtonEnabledDefaultsKey]) {
+        [gUIExtractButton removeFromSuperview];
+        return;
+    }
+    UIWindow *window = RUINForegroundKeyWindow();
+    if (!window) return;
+    if (!gUIExtractButton) {
+        UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
+        [button setTitle:RUINLocalizedString(@"developer.ui_extract_button") forState:UIControlStateNormal];
+        [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        button.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+        button.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
+        button.layer.cornerRadius = 12;
+        button.layer.borderWidth = 0.5;
+        button.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.35].CGColor;
+        button.accessibilityLabel = RUINLocalizedString(@"developer.ui_extract");
+        [button addAction:[UIAction actionWithHandler:^(__unused __kindof UIAction *action) {
+            RUINRunUIExtraction();
+            RUINPresentUIExtractionShare();
+        }] forControlEvents:UIControlEventTouchUpInside];
+        gUIExtractButton = button;
+    }
+    if (gUIExtractButton.superview != window) {
+        [gUIExtractButton removeFromSuperview];
+        [window addSubview:gUIExtractButton];
+    }
+    CGFloat width = 64, height = 24;
+    gUIExtractButton.frame = CGRectMake(CGRectGetWidth(window.bounds) - width - 8,
+        window.safeAreaInsets.top + 2, width, height);
+    [window bringSubviewToFront:gUIExtractButton];
+}
+
+void RUINRefreshUIExtractButton(void) {
+    RUINInstallUIExtractionButton();
+}
+
+void RUINInstallUIExtractionButton(void) {
+    [NSUserDefaults.standardUserDefaults registerDefaults:@{RUINUIExtractButtonEnabledDefaultsKey: @NO}];
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ RUINInstallUIExtractionButton(); });
+        return;
+    }
+    if (!RUINInspectorTargetMatches()) return;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification
+            object:nil queue:NSOperationQueue.mainQueue
+            usingBlock:^(__unused NSNotification *note) { RUINAttachUIExtractButton(); }];
+        [NSNotificationCenter.defaultCenter addObserverForName:UIWindowDidBecomeKeyNotification
+            object:nil queue:NSOperationQueue.mainQueue
+            usingBlock:^(__unused NSNotification *note) { RUINAttachUIExtractButton(); }];
+    });
+    RUINAttachUIExtractButton();
+}
+#endif
+
 NSDictionary<NSString *, id> *RuntimeInspectorDiagnostics(void) {
     static NSArray *names;
     static dispatch_once_t once;
@@ -917,6 +1315,10 @@ NSDictionary<NSString *, id> *RuntimeInspectorDiagnostics(void) {
         @"muteLastGestureState":@(atomic_load(&gMuteLastGestureState)),
         @"muteLastSenderClass":gMuteLastSenderClass ?: NSNull.null,
         @"presentationMethodEncoding":gPresentationEncoding ?: NSNull.null,
+#if RUIN_DEBUG
+        @"composerInspection": gComposerInspection ?: @{@"status": @"not_captured"},
+        @"composerInspections": @(gComposerInspectionCount),
+#endif
         @"snapshots": @(atomic_load(&gSnapshots)), @"controllers": @(atomic_load(&gControllerCount)),
         @"swiftFieldNames": @(atomic_load(&gFieldNameCount)), @"foregroundWindowFound": @(atomic_load(&gForegroundWindowFound)),
         @"views": @(atomic_load(&gViewCount)), @"controls": @(atomic_load(&gControlCount)),

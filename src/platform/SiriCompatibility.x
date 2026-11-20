@@ -1,6 +1,7 @@
 %config(generator=internal);
 
 #import "SiriCompatibility.h"
+#import "../core/StartupProfiler.h"
 #import "../core/TargetMetadata.h"
 #import "../known/FeatureImage.h"
 #import <Intents/INVocabulary.h>
@@ -60,10 +61,15 @@ void RUINInstallSiriCompatibility(void) {
     @synchronized (NSProcessInfo.processInfo) {
         if (atomic_load(&sInstalled)) return;
         NSDictionary *info = NSBundle.mainBundle.infoDictionary;
-        if (!RUINTargetMetadataMatchesInfo(info)) {
+        RUIN_PROFILE_BEGIN("siri.target_match");
+        BOOL targetMatches = RUINTargetMetadataMatchesInfo(info);
+        RUIN_PROFILE_END(targetMatches ? RUINProfileStatusOK : RUINProfileStatusFailed);
+        if (!targetMatches) {
             atomic_store(&sStatus, "wrong_target"); return;
         }
+        RUIN_PROFILE_BEGIN("siri.entitlement");
         int entitlement = RUINSiriEntitlement();
+        RUIN_PROFILE_END(RUINProfileStatusOK);
         atomic_store(&sEntitlement, entitlement);
         if (entitlement != 0) {
             atomic_store(&sStatus, entitlement == 1 ? "native_entitled" : "entitlement_unreadable"); return;
@@ -76,23 +82,30 @@ void RUINInstallSiriCompatibility(void) {
         // check_siri_compatibility.py --binary rechecks that disassembly proof.
         // The ObjC syncContactNames/syncContactGroupNames wrappers are not a
         // shared root: native Swift callers also schedule the same work directly.
+        RUIN_PROFILE_BEGIN("siri.mapping_lookup");
         const RUINVersionMapping *mapping = RUINMappingForInfo(info);
+        RUIN_PROFILE_END(mapping ? RUINProfileStatusOK : RUINProfileStatusFailed);
         if (!mapping || strcmp(mapping->host.uuid, "614CED59-07E5-372D-94B2-D4901870C7A0")) {
             atomic_store(&sStatus, "nil_safety_unproven"); return;
         }
         Class owner = objc_getClass("_TtC4LINE32NLIntentVocabularyControllerObjC");
         RUINFeatureImage image = {0};
-        if (!owner || !RUINResolveFeatureImage(&mapping->host, owner, &image)) {
+        RUIN_PROFILE_BEGIN("siri.resolve_image");
+        BOOL imageResolved = owner && RUINResolveFeatureImage(&mapping->host, owner, &image);
+        RUIN_PROFILE_END(imageResolved ? RUINProfileStatusOK : RUINProfileStatusFailed);
+        if (!imageResolved) {
             atomic_store(&sStatus, "owner_image_unavailable"); return;
         }
         Class vocabulary = objc_getClass("INVocabulary");
         Method factory = NULL;
         unsigned count = 0;
+        RUIN_PROFILE_BEGIN("siri.method_scan");
         Method *methods = class_copyMethodList(object_getClass(vocabulary), &count);
         for (unsigned i = 0; i < count; i++) {
             if (method_getName(methods[i]) == @selector(sharedVocabulary)) { factory = methods[i]; break; }
         }
         free(methods);
+        RUIN_PROFILE_END(factory ? RUINProfileStatusOK : RUINProfileStatusFailed);
         if (!factory || strcmp(method_getTypeEncoding(factory), "@16@0:8") ||
             !method_getImplementation(factory)) {
             RUINReleaseFeatureImage(&image);
@@ -100,7 +113,9 @@ void RUINInstallSiriCompatibility(void) {
         }
         sSiriImage = image;
         sVocabularyClass = vocabulary;
+        RUIN_PROFILE_BEGIN("siri.init_hooks");
         %init(RUINSiriVocabulary);
+        RUIN_PROFILE_END(RUINProfileStatusOK);
         atomic_store(&sInstalled, true);
         atomic_store(&sStatus, "installed");
     }

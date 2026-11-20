@@ -30,4 +30,5 @@
 
 @protocol RUINLINESecondaryLoginCalls <NSObject>
 - (void)showQRCodeLoginButtonPressed;
+- (void)showPrimaryDeviceLoginButtonPressed;
 @end

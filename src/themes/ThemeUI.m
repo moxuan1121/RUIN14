@@ -5,6 +5,8 @@
 #import "ThemeProductIdentity.h"
 #import "ThemeStoreResolver.h"
 #import "NativeThemeWorkflow.h"
+#import "ThemeArchive.h"
+#import <objc/runtime.h>
 #import "../core/Localization.h"
 
 // Main-queue state keeps an in-progress UI download visible after reopening.
@@ -122,6 +124,161 @@ static NSString *RUINThemeUITrim(NSString *value)
 {
     return [value stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
 }
+
+
+// MARK: - Theme package previews
+
+static NSCache<NSString *, UIImage *> *RUINThemePreviewMemoryCache(void)
+{
+    static NSCache *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSCache new]; cache.countLimit = 64; });
+    return cache;
+}
+
+static NSMutableDictionary<NSString *, NSMutableArray<void (^)(UIImage * _Nullable)> *> *RUINThemePreviewPending(void)
+{
+    static NSMutableDictionary *pending;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ pending = [NSMutableDictionary dictionary]; });
+    return pending;
+}
+
+static NSURL *RUINThemePreviewCacheDirectory(void)
+{
+    NSURL *caches = [NSFileManager.defaultManager URLForDirectory:NSCachesDirectory inDomain:NSUserDomainMask appropriateForURL:nil create:NO error:nil];
+    NSURL *dir = [caches URLByAppendingPathComponent:@"RUINThemePreviews" isDirectory:YES];
+    [NSFileManager.defaultManager createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return dir;
+}
+
+static NSString *RUINThemePreviewCacheKey(NSDictionary *record, NSURL *url)
+{
+    NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:url.path error:nil];
+    long long size = [attrs[NSFileSize] longLongValue];
+    long long mtime = (long long)[attrs[NSFileModificationDate] timeIntervalSince1970];
+    NSString *raw = [NSString stringWithFormat:@"%@-%@-%lld-%lld",
+        RUINThemeUIString(record[@"productID"]), RUINThemeUIVersion(record), size, mtime];
+    NSMutableString *key = [NSMutableString string];
+    for (NSUInteger i = 0; i < raw.length; i++) {
+        unichar c = [raw characterAtIndex:i];
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '-' || c == '.') [key appendFormat:@"%C", c];
+        else [key appendString:@"_"];
+    }
+    return key;
+}
+
+static UIImage *RUINThemePreviewPickImage(NSURL *stageDir)
+{
+    NSDirectoryEnumerator *enumerator = [NSFileManager.defaultManager enumeratorAtURL:stageDir
+        includingPropertiesForKeys:@[NSURLIsDirectoryKey] options:0 errorHandler:nil];
+    UIImage *bestImage = nil;
+    double bestScore = -1;
+    for (NSURL *file in enumerator) {
+        NSString *ext = file.pathExtension.lowercaseString;
+        if (!([ext isEqualToString:@"png"] || [ext isEqualToString:@"jpg"] || [ext isEqualToString:@"jpeg"])) continue;
+        if ([file.path containsString:@"__MACOSX"]) continue;
+        NSNumber *isDir = nil;
+        [file getResourceValue:&isDir forKey:NSURLIsDirectoryKey error:nil];
+        if (isDir.boolValue) continue;
+        UIImage *image = [UIImage imageWithContentsOfFile:file.path];
+        if (!image) continue;
+        CGFloat pixels = (CGFloat)CGImageGetWidth(image.CGImage) * (CGFloat)CGImageGetHeight(image.CGImage);
+        NSString *name = file.lastPathComponent.lowercaseString;
+        double score = MIN(pixels, 4000000.0) / 100000.0;
+        if ([name containsString:@"preview"]) score += 100;
+        if ([name containsString:@"thumbnail"] || [name containsString:@"thumb"]) score += 90;
+        if ([name containsString:@"main"]) score += 50;
+        if ([name containsString:@"background"] || [name containsString:@"_bg"] || [name hasPrefix:@"bg"]) score += 45;
+        if ([name containsString:@"top"]) score += 30;
+        if (score > bestScore) { bestScore = score; bestImage = image; }
+    }
+    return bestImage;
+}
+
+static UIImage *RUINThemePreviewDownscale(UIImage *image, CGFloat maxDimension)
+{
+    CGFloat width = (CGFloat)CGImageGetWidth(image.CGImage), height = (CGFloat)CGImageGetHeight(image.CGImage);
+    if (MAX(width, height) <= maxDimension) return image;
+    CGFloat scale = maxDimension / MAX(width, height);
+    CGSize size = CGSizeMake(MAX(1, floor(width * scale)), MAX(1, floor(height * scale)));
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size];
+    return [renderer imageWithActions:^(__unused UIGraphicsImageRendererContext *context) {
+        [image drawInRect:CGRectMake(0, 0, size.width, size.height)];
+    }];
+}
+
+static void RUINThemePreviewLoad(NSDictionary *record, void (^completion)(UIImage * _Nullable image))
+{
+    NSURL *url = RUINThemeUIArchiveURL(record);
+    if (!url) { completion(nil); return; }
+    NSString *key = RUINThemePreviewCacheKey(record, url);
+    UIImage *cached = [RUINThemePreviewMemoryCache() objectForKey:key];
+    if (cached) { completion(cached); return; }
+    NSURL *cacheFile = [RUINThemePreviewCacheDirectory() URLByAppendingPathComponent:[key stringByAppendingPathExtension:@"png"]];
+    @synchronized (RUINThemePreviewPending()) {
+        NSMutableArray *waiters = RUINThemePreviewPending()[key];
+        if (waiters) { [waiters addObject:[completion copy]]; return; }
+        RUINThemePreviewPending()[key] = [NSMutableArray arrayWithObject:[completion copy]];
+    }
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @autoreleasepool {
+            UIImage *image = [UIImage imageWithContentsOfFile:cacheFile.path];
+            if (!image) {
+                NSURL *stageRoot = [RUINThemePreviewCacheDirectory() URLByAppendingPathComponent:@"stage" isDirectory:YES];
+                [NSFileManager.defaultManager createDirectoryAtURL:stageRoot withIntermediateDirectories:YES attributes:nil error:nil];
+                NSError *error = nil;
+                NSURL *stage = RUINStageThemeArchiveAtURL(url, stageRoot, &error);
+                if (stage) {
+                    UIImage *picked = RUINThemePreviewPickImage(stage);
+                    if (picked) {
+                        image = RUINThemePreviewDownscale(picked, 1200);
+                        NSData *png = UIImagePNGRepresentation(image);
+                        if (png) [png writeToURL:cacheFile atomically:YES];
+                    }
+                    [NSFileManager.defaultManager removeItemAtURL:stage error:nil];
+                }
+            }
+            if (image) [RUINThemePreviewMemoryCache() setObject:image forKey:key];
+            NSArray *waiters = nil;
+            @synchronized (RUINThemePreviewPending()) {
+                waiters = [RUINThemePreviewPending()[key] copy];
+                [RUINThemePreviewPending() removeObjectForKey:key];
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                for (void (^waiter)(UIImage *) in waiters) waiter(image);
+            });
+        }
+    });
+}
+
+static UIImage *RUINThemePreviewThumbnail(UIImage *image)
+{
+    // Renderer sizes are points; the default format already renders at the
+    // screen scale, so 56pt yields a 168px bitmap on a 3x display.
+    CGSize size = CGSizeMake(56, 56);
+    if (!image || image.size.width <= 0 || image.size.height <= 0) return image;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size];
+    return [renderer imageWithActions:^(__unused UIGraphicsImageRendererContext *context) {
+        CGFloat scale = MAX(size.width / image.size.width, size.height / image.size.height);
+        CGSize drawn = CGSizeMake(image.size.width * scale, image.size.height * scale);
+        [image drawInRect:CGRectMake((size.width - drawn.width) / 2, (size.height - drawn.height) / 2, drawn.width, drawn.height)];
+    }];
+}
+
+static NSString *RUINThemePackageSizeText(NSDictionary *record)
+{
+    NSURL *url = RUINThemeUIArchiveURL(record);
+    NSDictionary *attrs = url ? [NSFileManager.defaultManager attributesOfItemAtPath:url.path error:nil] : nil;
+    if (!attrs) return RUINLocalizedString(@"common.unverified");
+    return [NSByteCountFormatter stringFromByteCount:[attrs[NSFileSize] longLongValue] countStyle:NSByteCountFormatterCountStyleFile];
+}
+
+@class RUINThemeSettingsViewController;
+
+@interface RUINThemePackageViewController : UITableViewController <UIDocumentInteractionControllerDelegate>
+- (instancetype)initWithRecord:(NSDictionary *)record listController:(RUINThemeSettingsViewController *)listController;
+@end
 
 @interface RUINThemeSettingsViewController : UITableViewController <UIDocumentInteractionControllerDelegate>
 @property(nonatomic, copy) NSArray<NSDictionary *> *archives;
@@ -374,9 +531,40 @@ static NSString *RUINThemeUITrim(NSString *value)
         if (records.count) {
             NSDictionary *record = records[path.row];
             cell.textLabel.text = RUINThemeUIName(record);
-            cell.detailTextLabel.text = [NSString stringWithFormat:(RUINLocalizedString(@"themes.downloaded_file_details") ?: @"商品ID: %@\nバージョン: %@%@"),
-                RUINThemeUIString(record[@"productID"]), RUINThemeUIVersion(record),
-                path.section == RUINThemeUISectionNative ? [@" · " stringByAppendingString:RUINThemeUINativeStatus(record)] : @""];
+            if (path.section == RUINThemeUISectionSaved) {
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"v%@ · %@",
+                    RUINThemeUIVersion(record), RUINThemePackageSizeText(record)];
+                cell.imageView.layer.cornerRadius = 12;
+                cell.imageView.clipsToBounds = YES;
+                NSURL *archiveURL = RUINThemeUIArchiveURL(record);
+                NSString *key = archiveURL ? RUINThemePreviewCacheKey(record, archiveURL) : nil;
+                objc_setAssociatedObject(cell, "ruin.packageKey", key, OBJC_ASSOCIATION_COPY_NONATOMIC);
+                UIImage *thumb = key ? [RUINThemePreviewMemoryCache() objectForKey:[key stringByAppendingString:@"#thumb"]] : nil;
+                if (thumb) {
+                    cell.imageView.image = thumb;
+                } else {
+                    cell.imageView.image = [UIImage systemImageNamed:@"paintpalette.fill"];
+                    cell.imageView.tintColor = UIColor.systemGray3Color;
+                    if (key) {
+                        __weak UITableViewCell *weakCell = cell;
+                        RUINThemePreviewLoad(record, ^(UIImage *image) {
+                            UITableViewCell *strongCell = weakCell;
+                            if (!strongCell || !image) return;
+                            if (![objc_getAssociatedObject(strongCell, "ruin.packageKey") isEqual:key]) return;
+                            UIImage *resized = RUINThemePreviewThumbnail(image);
+                            [RUINThemePreviewMemoryCache() setObject:resized forKey:[key stringByAppendingString:@"#thumb"]];
+                            strongCell.imageView.image = resized;
+                            strongCell.imageView.tintColor = nil;
+                            [strongCell setNeedsLayout];
+                        });
+                    }
+                }
+            } else {
+                cell.detailTextLabel.text = [NSString stringWithFormat:(RUINLocalizedString(@"themes.downloaded_file_details") ?: @"商品ID: %@\nバージョン: %@%@"),
+                    RUINThemeUIString(record[@"productID"]), RUINThemeUIVersion(record),
+                    [@" · " stringByAppendingString:RUINThemeUINativeStatus(record)]];
+                cell.imageView.image = nil;
+            }
             cell.accessoryType = path.section == RUINThemeUISectionSaved ? UITableViewCellAccessoryDisclosureIndicator : UITableViewCellAccessoryDetailButton;
             cell.userInteractionEnabled = path.section == RUINThemeUISectionNative || (!gThemeUIDownloading && !self.checkingArchive);
             cell.selectionStyle = cell.userInteractionEnabled ? UITableViewCellSelectionStyleDefault : UITableViewCellSelectionStyleNone;
@@ -453,7 +641,10 @@ static NSString *RUINThemeUITrim(NSString *value)
     }
     NSDictionary *record = records[path.row];
     if (path.section == RUINThemeUISectionNative) [self showNativeRecord:record];
-    else if (!gThemeUIDownloading && !self.checkingArchive) [self showArchiveActions:record atIndexPath:path];
+    else if (!gThemeUIDownloading && !self.checkingArchive) {
+        RUINThemePackageViewController *package = [[RUINThemePackageViewController alloc] initWithRecord:record listController:self];
+        [self.navigationController pushViewController:package animated:YES];
+    }
 }
 
 - (void)tableView:(UITableView *)tableView accessoryButtonTappedForRowWithIndexPath:(NSIndexPath *)path
@@ -607,29 +798,6 @@ static NSString *RUINThemeUITrim(NSString *value)
         ? CGRectMake(CGRectGetMidX(self.tableView.bounds), CGRectGetMidY(self.tableView.bounds), 1, 1) : visible;
 }
 
-- (void)showArchiveActions:(NSDictionary *)record atIndexPath:(NSIndexPath *)path
-{
-    if (!RUINThemeUIArchiveURL(record)) return;
-    CGRect rect = [self.tableView rectForRowAtIndexPath:path];
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:RUINThemeUIName(record)
-        message:RUINLocalizedString(@"themes.add_to_native_hint")
-        preferredStyle:UIAlertControllerStyleActionSheet];
-    __weak typeof(self) weakSelf = self;
-    [menu addAction:[UIAlertAction actionWithTitle:RUINLocalizedString(@"themes.add_to_native") style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
-        RUINOpenDownloadedThemes(weakSelf);
-    }]];
-    [menu addAction:[UIAlertAction actionWithTitle:RUINLocalizedString(@"common.preview") style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
-        [weakSelf openArchive:record preview:YES anchorRect:rect];
-    }]];
-    [menu addAction:[UIAlertAction actionWithTitle:RUINLocalizedString(@"media.share_action") style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
-        [weakSelf openArchive:record preview:NO anchorRect:rect];
-    }]];
-    [menu addAction:[UIAlertAction actionWithTitle:RUINLocalizedString(@"common.cancel") style:UIAlertActionStyleCancel handler:nil]];
-    menu.popoverPresentationController.sourceView = self.tableView;
-    menu.popoverPresentationController.sourceRect = [self menuRect:rect];
-    [self presentViewController:menu animated:YES completion:nil];
-}
-
 - (void)openArchive:(NSDictionary *)record preview:(BOOL)preview anchorRect:(CGRect)rect
 {
     NSURL *requestedURL = RUINThemeUIArchiveURL(record);
@@ -667,6 +835,296 @@ static NSString *RUINThemeUITrim(NSString *value)
             });
         }
     });
+}
+
+- (UIViewController *)documentInteractionControllerViewControllerForPreview:(UIDocumentInteractionController *)controller
+{
+    return self.navigationController ?: self;
+}
+
+@end
+
+
+// MARK: - Full-screen preview viewer
+
+@interface RUINThemePreviewViewerController : UIViewController <UIScrollViewDelegate>
+@property(nonatomic, strong) UIImage *image;
+@property(nonatomic, strong) UIImageView *imageView;
+@end
+
+@implementation RUINThemePreviewViewerController
+
+- (instancetype)initWithImage:(UIImage *)image
+{
+    self = [super init];
+    if (self) _image = image;
+    return self;
+}
+
+- (void)viewDidLoad
+{
+    [super viewDidLoad];
+    self.view.backgroundColor = UIColor.blackColor;
+    UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:self.view.bounds];
+    scroll.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    scroll.delegate = self;
+    scroll.minimumZoomScale = 1.0;
+    scroll.maximumZoomScale = 4.0;
+    scroll.backgroundColor = UIColor.blackColor;
+    self.imageView = [[UIImageView alloc] initWithImage:self.image];
+    self.imageView.contentMode = UIViewContentModeScaleAspectFit;
+    self.imageView.frame = scroll.bounds;
+    [scroll addSubview:self.imageView];
+    [self.view addSubview:scroll];
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(close)];
+    [self.view addGestureRecognizer:tap];
+}
+
+- (UIView *)viewForZoomingInScrollView:(UIScrollView *)scrollView { return self.imageView; }
+
+- (void)close { [self dismissViewControllerAnimated:YES completion:nil]; }
+
+@end
+
+// MARK: - Theme package detail
+
+@interface RUINThemeSettingsViewController (RUINPackageDetailSupport)
+- (void)reloadCatalog;
+@end
+
+@interface RUINThemePackageViewController ()
+@property(nonatomic, copy) NSDictionary *record;
+@property(nonatomic, weak) RUINThemeSettingsViewController *listController;
+@property(nonatomic, strong) UIImage *previewImage;
+@property(nonatomic) BOOL previewLoaded;
+@property(nonatomic, strong) UIDocumentInteractionController *documentController;
+@end
+
+static void RUINThemeUIApplySystemNavigationBarAppearance(UIViewController *controller)
+{
+    UITraitCollection *traits = controller.viewIfLoaded ? controller.viewIfLoaded.traitCollection : controller.traitCollection;
+    UIColor *labelColor = [UIColor.labelColor resolvedColorWithTraitCollection:traits];
+    UINavigationBarAppearance *appearance = [UINavigationBarAppearance new];
+    [appearance configureWithDefaultBackground];
+    appearance.titleTextAttributes = @{NSForegroundColorAttributeName: labelColor};
+    appearance.largeTitleTextAttributes = @{NSForegroundColorAttributeName: labelColor};
+    controller.navigationItem.standardAppearance = appearance;
+    controller.navigationItem.scrollEdgeAppearance = appearance;
+    controller.navigationItem.compactAppearance = appearance;
+}
+
+@implementation RUINThemePackageViewController
+
+- (instancetype)initWithRecord:(NSDictionary *)record listController:(RUINThemeSettingsViewController *)listController
+{
+    self = [super initWithStyle:UITableViewStyleInsetGrouped];
+    if (self) {
+        _record = [record copy];
+        _listController = listController;
+        self.title = RUINThemeUIName(record);
+        self.hidesBottomBarWhenPushed = YES;
+    }
+    return self;
+}
+
+- (void)viewWillAppear:(BOOL)animated
+{
+    [super viewWillAppear:animated];
+    RUINThemeUIApplySystemNavigationBarAppearance(self);
+}
+
+- (void)viewDidLoad
+{
+    [super viewDidLoad];
+    RUINThemeUIApplySystemNavigationBarAppearance(self);
+    self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeNever;
+    self.tableView.rowHeight = UITableViewAutomaticDimension;
+    __weak typeof(self) weakSelf = self;
+    RUINThemePreviewLoad(self.record, ^(UIImage *image) {
+        typeof(self) owner = weakSelf;
+        if (!owner) return;
+        owner.previewImage = image;
+        owner.previewLoaded = YES;
+        [owner.tableView reloadSections:[NSIndexSet indexSetWithIndex:0] withRowAnimation:UITableViewRowAnimationFade];
+    });
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 3; }
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
+{
+    return section == 0 ? 1 : section == 1 ? 4 : 3;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section
+{
+    return section == 1 ? RUINLocalizedString(@"themes.package_info") : nil;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
+{
+    return section == 2 ? RUINLocalizedString(@"themes.add_to_native_hint") : nil;
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)path
+{
+    if (path.section == 0) {
+        if (self.previewImage) {
+            CGFloat width = CGRectGetWidth(tableView.bounds) - 40;
+            CGFloat ratio = self.previewImage.size.height / MAX(self.previewImage.size.width, 1);
+            return MIN(MAX(width * ratio, 180), 460);
+        }
+        return 120;
+    }
+    return UITableViewAutomaticDimension;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)path
+{
+    if (path.section == 0) {
+        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"PackagePreview"];
+        if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"PackagePreview"];
+        cell.selectionStyle = self.previewImage ? UITableViewCellSelectionStyleDefault : UITableViewCellSelectionStyleNone;
+        cell.textLabel.text = nil;
+        cell.accessoryView = nil;
+        UIImageView *imageView = [cell.contentView viewWithTag:777];
+        if (!imageView) {
+            imageView = [UIImageView new];
+            imageView.tag = 777;
+            imageView.contentMode = UIViewContentModeScaleAspectFit;
+            imageView.clipsToBounds = YES;
+            imageView.layer.cornerRadius = 12;
+            imageView.translatesAutoresizingMaskIntoConstraints = NO;
+            [cell.contentView addSubview:imageView];
+            [NSLayoutConstraint activateConstraints:@[
+                [imageView.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor],
+                [imageView.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor],
+                [imageView.topAnchor constraintEqualToAnchor:cell.contentView.topAnchor],
+                [imageView.bottomAnchor constraintEqualToAnchor:cell.contentView.bottomAnchor],
+            ]];
+        }
+        imageView.image = self.previewImage;
+        if (!self.previewLoaded) {
+            cell.textLabel.text = RUINLocalizedString(@"themes.generating_preview");
+            cell.textLabel.textColor = UIColor.secondaryLabelColor;
+            UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+            [spinner startAnimating];
+            cell.accessoryView = spinner;
+        } else if (!self.previewImage) {
+            cell.textLabel.text = RUINLocalizedString(@"themes.preview_unavailable_package");
+            cell.textLabel.textColor = UIColor.secondaryLabelColor;
+        }
+        return cell;
+    }
+    if (path.section == 1) {
+        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"PackageInfo"];
+        if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:@"PackageInfo"];
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        NSURL *url = RUINThemeUIArchiveURL(self.record);
+        switch (path.row) {
+            case 0: cell.textLabel.text = RUINLocalizedString(@"themes.product_id"); cell.detailTextLabel.text = RUINThemeUIString(self.record[@"productID"]); break;
+            case 1: cell.textLabel.text = RUINLocalizedString(@"themes.version_label"); cell.detailTextLabel.text = RUINThemeUIVersion(self.record); break;
+            case 2: cell.textLabel.text = RUINLocalizedString(@"themes.package_size"); cell.detailTextLabel.text = RUINThemePackageSizeText(self.record); break;
+            default: cell.textLabel.text = RUINLocalizedString(@"themes.file_name"); cell.detailTextLabel.text = url.lastPathComponent ?: @""; break;
+        }
+        cell.detailTextLabel.adjustsFontSizeToFitWidth = YES;
+        cell.detailTextLabel.minimumScaleFactor = 0.7;
+        return cell;
+    }
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"PackageAction"];
+    if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"PackageAction"];
+    cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    cell.textLabel.textColor = UIColor.labelColor;
+    switch (path.row) {
+        case 0: cell.textLabel.text = RUINLocalizedString(@"themes.add_to_native"); break;
+        case 1: cell.textLabel.text = RUINLocalizedString(@"media.share_action"); break;
+        default:
+            cell.textLabel.text = RUINLocalizedString(@"themes.delete_package");
+            cell.textLabel.textColor = UIColor.systemRedColor;
+            cell.accessoryType = UITableViewCellAccessoryNone;
+            break;
+    }
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)path
+{
+    [tableView deselectRowAtIndexPath:path animated:YES];
+    if (path.section == 0) {
+        if (self.previewImage) {
+            RUINThemePreviewViewerController *viewer = [[RUINThemePreviewViewerController alloc] initWithImage:self.previewImage];
+            viewer.modalPresentationStyle = UIModalPresentationFullScreen;
+            [self presentViewController:viewer animated:YES completion:nil];
+        }
+        return;
+    }
+    if (path.section != 2) return;
+    if (path.row == 0) RUINOpenDownloadedThemes(self);
+    else if (path.row == 1) [self shareArchive];
+    else [self confirmDelete];
+}
+
+- (void)shareArchive
+{
+    NSURL *requestedURL = RUINThemeUIArchiveURL(self.record);
+    if (!requestedURL) return;
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @autoreleasepool {
+            NSError *error = nil;
+            NSArray<NSDictionary *> *catalog = RUINThemeCatalog(&error);
+            NSURL *verifiedURL = nil;
+            for (NSDictionary *candidate in catalog) {
+                NSURL *url = RUINThemeUIArchiveURL(candidate);
+                if (url && [url.path isEqualToString:requestedURL.path]) { verifiedURL = url; break; }
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                typeof(self) owner = weakSelf;
+                if (!owner || !owner.viewIfLoaded.window) return;
+                if (!verifiedURL) {
+                    UIAlertController *alert = [UIAlertController alertControllerWithTitle:RUINLocalizedString(@"media.share_failed")
+                        message:RUINLocalizedString(@"themes.archive_validation_failed") preferredStyle:UIAlertControllerStyleAlert];
+                    [alert addAction:[UIAlertAction actionWithTitle:RUINLocalizedString(@"common.close") style:UIAlertActionStyleCancel handler:nil]];
+                    [owner presentViewController:alert animated:YES completion:nil];
+                    return;
+                }
+                UIDocumentInteractionController *document = [UIDocumentInteractionController interactionControllerWithURL:verifiedURL];
+                document.delegate = owner;
+                document.UTI = @"jp.naver.talk.theme-package";
+                owner.documentController = document;
+                CGRect rect = [owner.tableView rectForRowAtIndexPath:[NSIndexPath indexPathForRow:1 inSection:2]];
+                if (![document presentOptionsMenuFromRect:rect inView:owner.tableView animated:YES]) {
+                    UIAlertController *alert = [UIAlertController alertControllerWithTitle:RUINLocalizedString(@"media.share_failed")
+                        message:RUINLocalizedString(@"media.no_share_targets") preferredStyle:UIAlertControllerStyleAlert];
+                    [alert addAction:[UIAlertAction actionWithTitle:RUINLocalizedString(@"common.close") style:UIAlertActionStyleCancel handler:nil]];
+                    [owner presentViewController:alert animated:YES completion:nil];
+                }
+            });
+        }
+    });
+}
+
+- (void)confirmDelete
+{
+    NSURL *url = RUINThemeUIArchiveURL(self.record);
+    if (!url) return;
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:RUINLocalizedString(@"themes.delete_package")
+        message:RUINLocalizedString(@"themes.delete_package_message") preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:RUINLocalizedString(@"common.cancel") style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:RUINLocalizedString(@"themes.delete_package") style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
+        typeof(self) owner = weakSelf;
+        if (!owner) return;
+        NSString *key = RUINThemePreviewCacheKey(owner.record, url);
+        [NSFileManager.defaultManager removeItemAtURL:url error:nil];
+        [NSFileManager.defaultManager removeItemAtURL:[RUINThemePreviewCacheDirectory() URLByAppendingPathComponent:[key stringByAppendingPathExtension:@"png"]] error:nil];
+        [RUINThemePreviewMemoryCache() removeObjectForKey:key];
+        [RUINThemePreviewMemoryCache() removeObjectForKey:[key stringByAppendingString:@"#thumb"]];
+        RUINThemeSettingsViewController *list = owner.listController;
+        [owner.navigationController popViewControllerAnimated:YES];
+        [list reloadCatalog];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (UIViewController *)documentInteractionControllerViewControllerForPreview:(UIDocumentInteractionController *)controller

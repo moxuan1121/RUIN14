@@ -242,7 +242,7 @@ def main() -> None:
     activation = tweak.split("static void RUINApplicationDidBecomeActive(void) {", 1)[1].split(
         "__attribute__((constructor))", 1
     )[0]
-    assert "RUINInstallLocalFontHooks();" in activation
+    assert "RUINInstallLocalFontHooks()" in activation
     # Extract the complete production scope/hook/install/diagnostic section; only UIKit UI is omitted.
     production = "%config(generator=internal);\n" + SOURCE[SOURCE.index("#import <dlfcn.h>"):]
     with tempfile.TemporaryDirectory(prefix="ruin-font-host-") as temporary:

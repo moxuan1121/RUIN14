@@ -8,6 +8,12 @@
 #import "../core/TargetMetadata.h"
 #import "LINEPrivateCalls.h"
 #import "BinaryVerifier.h"
+#if !defined(RUIN_HOST_CHECK)
+#import "RUINSettings.h"
+#else
+@class UIViewController;
+FOUNDATION_EXPORT void RUINPresentFirstRunSetupIfNeeded(UIViewController *presenter);
+#endif
 #import "FeatureImage.h"
 #import <UIKit/UIKit.h>
 #import <UIKit/UIGestureRecognizerSubclass.h>
@@ -35,7 +41,7 @@ static atomic_ulong unscopedLINEQueries, backgroundLINEQueries, otherImageQuerie
 static _Atomic(const void *) verifiedLoginGuestImage;
 static RUINFeatureImage loginGuestImage;
 static atomic_bool loginGuestProofScheduled = ATOMIC_VAR_INIT(false);
-static char gestureKey, welcomeVisibleKey;
+static char gestureKey, welcomeVisibleKey, secondaryButtonKey;
 static NSString *lastLoginScreen;
 static __weak UIViewController *loginProjectionOwner;
 static _Thread_local NSUInteger loginProjectionDepth;
@@ -332,6 +338,44 @@ static BOOL RUINPointIsOnNativeLoginButton(UIViewController *owner, CGPoint poin
 - (BOOL)canBePreventedByGestureRecognizer:(__unused UIGestureRecognizer *)other { return NO; }
 @end
 
+// A visible third button under the native login/register stack. The
+// long-press mode menu depends on the SwiftUI accessibility graph, which
+// never materializes in guest environments, so the Welcome screen also
+// gets a direct entry: tapping it selects the secondary (sub-device)
+// mode and either asks for a restart (the tablet role is a launch-time
+// projection) or, once the role is active, starts the login directly.
+// Placement is bottom-anchored to the safe area so it stacks directly
+// above the native login button in the verified Welcome layout.
+static void RUINAttachSecondaryLoginButton(UIViewController *controller) {
+    UIView *root = controller.viewIfLoaded;
+    if (!root) return;
+    UIButton *button = objc_getAssociatedObject(root, &secondaryButtonKey);
+    if (button && button.superview == root) return;
+    if (!button) {
+        button = [UIButton buttonWithType:UIButtonTypeCustom];
+        NSString *title = RUINLocalizedString(@"login.secondary_action");
+        [button setTitle:title forState:UIControlStateNormal];
+        [button setTitleColor:UIColor.blackColor forState:UIControlStateNormal];
+        button.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+        button.backgroundColor = UIColor.whiteColor;
+        button.layer.cornerRadius = 10;
+        button.layer.borderWidth = 1;
+        button.layer.borderColor = [UIColor colorWithWhite:0.85 alpha:1].CGColor;
+        button.accessibilityLabel = title;
+        [button addTarget:controller action:sel_registerName("ruin_secondaryLoginTapped")
+            forControlEvents:UIControlEventTouchUpInside];
+        objc_setAssociatedObject(root, &secondaryButtonKey, button, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    [root addSubview:button];
+    button.translatesAutoresizingMaskIntoConstraints = NO;
+    [NSLayoutConstraint activateConstraints:@[
+        [button.leadingAnchor constraintEqualToAnchor:root.safeAreaLayoutGuide.leadingAnchor constant:16],
+        [button.trailingAnchor constraintEqualToAnchor:root.safeAreaLayoutGuide.trailingAnchor constant:-16],
+        [button.heightAnchor constraintEqualToConstant:48],
+        [button.bottomAnchor constraintEqualToAnchor:root.safeAreaLayoutGuide.bottomAnchor constant:-127],
+    ]];
+}
+
 static void RUINWelcomeDidAppear(UIViewController *controller) {
     lastLoginScreen = @"welcome";
     loginProjectionOwner = controller;
@@ -360,6 +404,8 @@ static void RUINWelcomeDidAppear(UIViewController *controller) {
         [targetView addGestureRecognizer:gesture];
         objc_setAssociatedObject(targetView, &gestureKey, gesture, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
+    RUINAttachSecondaryLoginButton(controller);
+    RUINPresentFirstRunSetupIfNeeded(controller);
     if (activeSecondaryMode && !autoLoginOpened &&
         [NSProcessInfo.processInfo.environment[@"RUIN_OPEN_SECONDARY_LOGIN"] isEqual:@"1"]) {
         autoLoginOpened = YES;
@@ -371,9 +417,49 @@ static void RUINWelcomeDidAppear(UIViewController *controller) {
     }
 }
 
+static char primaryReturnButtonKey;
+
+// The secondary login screen's footer link (register a new account or
+// transfer one) leaves the sub-device flow entirely, which reads as a
+// mode switch when tapped. Cover the footer with a plain band and a
+// single explicit button that returns to the normal login through the
+// same primary-return path as the native action.
+static void RUINAttachPrimaryReturnButton(UIViewController *controller) {
+    UIView *root = controller.viewIfLoaded;
+    if (!root || objc_getAssociatedObject(root, &primaryReturnButtonKey)) return;
+    UIView *cover = [UIView new];
+    cover.backgroundColor = UIColor.whiteColor;
+    cover.translatesAutoresizingMaskIntoConstraints = NO;
+    [root addSubview:cover];
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
+    [button setTitle:RUINLocalizedString(@"login.back_to_primary_action") forState:UIControlStateNormal];
+    [button setTitleColor:UIColor.blackColor forState:UIControlStateNormal];
+    button.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    button.backgroundColor = UIColor.whiteColor;
+    button.layer.borderColor = [UIColor colorWithWhite:0.85 alpha:1].CGColor;
+    button.layer.borderWidth = 1;
+    button.layer.cornerRadius = 10;
+    [button addTarget:controller action:sel_registerName("ruin_backToPrimaryLogin")
+        forControlEvents:UIControlEventTouchUpInside];
+    button.translatesAutoresizingMaskIntoConstraints = NO;
+    [root addSubview:button];
+    objc_setAssociatedObject(root, &primaryReturnButtonKey, button, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [NSLayoutConstraint activateConstraints:@[
+        [cover.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
+        [cover.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
+        [cover.bottomAnchor constraintEqualToAnchor:root.bottomAnchor],
+        [cover.topAnchor constraintEqualToAnchor:button.topAnchor constant:-12],
+        [button.leadingAnchor constraintEqualToAnchor:root.safeAreaLayoutGuide.leadingAnchor constant:16],
+        [button.trailingAnchor constraintEqualToAnchor:root.safeAreaLayoutGuide.trailingAnchor constant:-16],
+        [button.heightAnchor constraintEqualToConstant:48],
+        [button.bottomAnchor constraintEqualToAnchor:root.safeAreaLayoutGuide.bottomAnchor constant:-16],
+    ]];
+}
+
 static void RUINSecondaryLoginDidAppear(UIViewController *controller) {
     lastLoginScreen = @"native_secondary_login";
     loginProjectionOwner = controller;
+    RUINAttachPrimaryReturnButton(controller);
     if (activeSecondaryMode && !autoQROpened &&
         [NSProcessInfo.processInfo.environment[@"RUIN_OPEN_SECONDARY_LOGIN"] isEqual:@"1"]) {
         autoQROpened = YES;
@@ -471,6 +557,21 @@ static void RUINScheduleWelcomeCatchUp(void) {
 {
     RUINPresentLoginModeMenu(self, gesture);
 }
+%new(v16@0:8)
+- (void)ruin_secondaryLoginTapped
+{
+    if (!RUINMigrationPreflight(self)) return;
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    if (![defaults boolForKey:RUINSecondaryLoginEnabledKey]) {
+        [defaults setBool:YES forKey:RUINSecondaryLoginEnabledKey];
+        [defaults synchronize];
+    }
+    if (!activeSecondaryMode) {
+        RUINShowLoginRestartNotice(self);
+        return;
+    }
+    [(id<RUINLINEWelcomeCalls>)self loginButtonAction];
+}
 %end
 %end
 
@@ -499,6 +600,11 @@ static void RUINScheduleWelcomeCatchUp(void) {
 }
 - (void)showPrimaryDeviceLoginButtonPressed {
     if (!RUINRequestPrimaryLoginAfterRestart(self)) %orig;
+}
+%new(v16@0:8)
+- (void)ruin_backToPrimaryLogin
+{
+    [(id<RUINLINESecondaryLoginCalls>)self showPrimaryDeviceLoginButtonPressed];
 }
 %end
 %end

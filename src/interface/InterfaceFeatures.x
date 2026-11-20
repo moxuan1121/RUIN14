@@ -2,6 +2,7 @@
 
 #import "TargetMetadata.h"
 #import "InterfaceFeatures.h"
+#import "ChatCatalog.h"
 #import "BinaryVerifier.h"
 
 #import <UIKit/UIKit.h>
@@ -30,6 +31,8 @@ NSString * const RUINHideAdsDefaultsKey = @"RUINInterfaceHideAds";
 NSString * const RUINHideRecommendationsDefaultsKey = @"RUINInterfaceHideRecommendations";
 NSString * const RUINHideVoiceInputDefaultsKey = @"RUINInterfaceHideVoiceInput";
 NSString * const RUINHideAgentIBarDefaultsKey = @"RUINInterfaceHideAgentIBar";
+NSString * const RUINFixPanelHeightDefaultsKey = @"RUINInterfaceFixPanelHeight";
+NSString * const RUINProfileHeaderLeftDefaultsKey = @"RUINInterfaceProfileHeaderLeft";
 
 NSString * const RUINInterfaceTabHome = @"home";
 NSString * const RUINInterfaceTabTalk = @"talk";
@@ -819,6 +822,396 @@ static BOOL RUINKeepNativeMenusForLaunch(void) {
 %end
 %end
 
+// MARK: - Bottom panel height fix
+//
+// In iPad-idiom sub-device sessions the chat bottom container that hosts
+// the sticker board and the plus menu keeps a zero height, so both panels
+// stay invisible even though the input bar switches into the open state.
+// When a panel is open but the container is collapsed, report and enforce
+// the height LINE itself uses for the working voice-recording panel in
+// the same environment (332pt, measured on device) for that container
+// only. The
+// container class, both selectors and their type encodings are verified
+// before hooking, mirroring the other interface hooks.
+static atomic_bool gFixPanelHeightEnabled = ATOMIC_VAR_INIT(true);
+static atomic_bool gPanelHeightHookInstalled;
+static atomic_uint_fast64_t gPanelHeightApplications;
+static double gPanelLastTargetHeight;  // main thread only
+static NSString *gPanelHeightHookStatus = @"pending";
+static char gPanelHeightConstraintKey;
+static atomic_bool gProfileHeaderLeftEnabled = ATOMIC_VAR_INIT(false);
+static atomic_uint gProfileHeaderApplyRuns = ATOMIC_VAR_INIT(0);
+static atomic_bool gProfileHeaderFoundContainer = ATOMIC_VAR_INIT(false);
+static atomic_bool gProfileHeaderHookInstalled;
+static NSString *gProfileHeaderHookStatus = @"pending";
+static atomic_bool gPanelTraitHookInstalled;
+static atomic_uint_fast64_t gPanelTraitApplications;
+static NSString *gPanelTraitHookStatus = @"pending";
+static BOOL RUINIsUIViewSubclass(Class cls);
+
+static BOOL RUINPanelHeightShouldFix(UIView *container) {
+    if (!atomic_load_explicit(&gFixPanelHeightEnabled, memory_order_relaxed)) return NO;
+    if (!atomic_load_explicit(&gTargetMatches, memory_order_relaxed)) return NO;
+    if (container.subviews.count) return YES;
+    UIView *bar = nil;
+    for (UIView *sibling in container.superview.subviews)
+        if ([NSStringFromClass(sibling.class) isEqual:@"LineMessagingUI.ChatInputBar"]) { bar = sibling; break; }
+    if (!bar) return NO;
+    // The bar scan below reflects over Swift fields; cache per bar briefly.
+    static __weak UIView *cachedBar;
+    static BOOL cachedSignal;
+    static NSTimeInterval cachedAt;
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    if (cachedBar == bar && now - cachedAt < 0.5) return cachedSignal;
+    BOOL signal = NO;
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:bar];
+    NSUInteger guard = 0;
+    while (stack.count && guard++ < 128 && !signal) {
+        UIView *view = stack.lastObject;
+        [stack removeLastObject];
+        if ([NSStringFromClass(view.class) isEqual:@"LineMessagingUI.ChatInputBarButton"]) {
+            NSString *kind = RUINCopySwiftEnumCaseName(view, "kind");
+            if ([kind isEqual:@"keyboard"]) signal = YES;
+            else if ([kind isEqual:@"plus"] &&
+                ([(UIButton *)view isSelected] || !CGAffineTransformIsIdentity(view.transform))) signal = YES;
+        }
+        [stack addObjectsFromArray:view.subviews];
+    }
+    cachedBar = bar;
+    cachedSignal = signal;
+    cachedAt = now;
+    return signal;
+}
+
+static double RUINPanelTargetHeight(UIView *container) {
+    // Match the height LINE itself gives this container in voice recording
+    // mode — the one bottom panel that works in iPad-idiom sub-device
+    // sessions (measured on device: 332pt).
+    double height = 332;
+    UIWindow *window = container.window;
+    if (window) height = MIN(height, CGRectGetHeight(window.bounds) * 0.65);
+    return height;
+}
+
+static void RUINPanelHeightApply(UIView *container) {
+    NSLayoutConstraint *constraint = objc_getAssociatedObject(container, &gPanelHeightConstraintKey);
+    if (!RUINPanelHeightShouldFix(container)) {
+        if (constraint.active) constraint.active = NO;
+        return;
+    }
+    if (CGRectGetHeight(container.bounds) >= 1 && !constraint.active) return;
+    double target = RUINPanelTargetHeight(container);
+    gPanelLastTargetHeight = target;
+    BOOL changed = NO;
+    if (!constraint) {
+        constraint = [container.heightAnchor constraintEqualToConstant:target];
+        constraint.priority = 999;
+        objc_setAssociatedObject(container, &gPanelHeightConstraintKey, constraint,
+            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        changed = YES;
+    }
+    if (constraint.constant != target) { constraint.constant = target; changed = YES; }
+    if (!constraint.active) {
+        constraint.active = YES;
+        atomic_fetch_add_explicit(&gPanelHeightApplications, 1, memory_order_relaxed);
+        changed = YES;
+    }
+    if (changed) [container invalidateIntrinsicContentSize];
+}
+
+%group RUINPanelHeightFix
+%hook RUINPanelHeightContainer
+- (CGSize)intrinsicContentSize
+{
+    CGSize size = %orig;
+    if (size.height < 1 && RUINPanelHeightShouldFix(self))
+        size.height = (CGFloat)RUINPanelTargetHeight(self);
+    return size;
+}
+- (void)layoutSubviews
+{
+    %orig;
+    RUINPanelHeightApply(self);
+}
+%end
+%end
+
+static void RUINInstallPanelHeightHooks(void) {
+    if (atomic_load(&gPanelHeightHookInstalled)) return;
+    Class cls = objc_getClass("_TtGC17LineMessagingUIV226ChatTopBottomContainerViewOS_16ChatBottomViewID_");
+    if (!cls) {
+        unsigned int count = 0;
+        Class *classes = objc_copyClassList(&count);
+        for (unsigned int i = 0; i < count && !cls; i++) {
+            const char *name = classes[i] ? class_getName(classes[i]) : NULL;
+            if (name && strstr(name, "ChatTopBottomContainerView") && strstr(name, "ChatBottomViewID") &&
+                RUINIsUIViewSubclass(classes[i])) cls = classes[i];
+        }
+        free(classes);
+    }
+    if (!cls) { gPanelHeightHookStatus = @"missing_class"; return; }
+    Method layout = class_getInstanceMethod(cls, @selector(layoutSubviews));
+    Method sizing = class_getInstanceMethod(cls, @selector(intrinsicContentSize));
+    const char *layoutTypes = layout ? method_getTypeEncoding(layout) : NULL;
+    const char *sizingTypes = sizing ? method_getTypeEncoding(sizing) : NULL;
+    if (!layoutTypes || strcmp(layoutTypes, "v16@0:8") ||
+        !sizingTypes || strcmp(sizingTypes, "{CGSize=dd}16@0:8")) {
+        gPanelHeightHookStatus = @"abi_mismatch"; return;
+    }
+    %init(RUINPanelHeightFix, RUINPanelHeightContainer = cls);
+    atomic_store(&gPanelHeightHookInstalled, true);
+    gPanelHeightHookStatus = @"installed";
+}
+
+// The chat is SwiftUI: its composer decides whether to build the bottom
+// panels from the trait idiom, not from UIDevice. The tablet idiom must
+// stay projected for the login device-role determination, so instead of
+// touching it, override only the chat view controller's trait collection
+// to the phone idiom (its parent keeps the override; the rest of the app
+// keeps the tablet traits). Same preference switch as the height fix.
+// The parent that received RUIN's override is remembered on the chat
+// controller, so turning the switch off clears only RUIN's own override and
+// never one LINE installed itself.
+static char RUINChatPanelTraitOverrideParentKey;
+
+%group RUINChatPanelTraits
+%hook RUINChatPanelTraitsController
+- (void)viewWillAppear:(BOOL)animated
+{
+    %orig(animated);
+    if (!atomic_load_explicit(&gTargetMatches, memory_order_relaxed)) return;
+    UIViewController *controller = (UIViewController *)self;
+    UIViewController *parent = controller.parentViewController;
+    UIViewController *overridden = objc_getAssociatedObject(controller, &RUINChatPanelTraitOverrideParentKey);
+    if (!atomic_load_explicit(&gFixPanelHeightEnabled, memory_order_relaxed)) {
+        if (overridden) {
+            if (overridden == parent) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                [parent setOverrideTraitCollection:nil forChildViewController:controller];
+#pragma clang diagnostic pop
+            }
+            objc_setAssociatedObject(controller, &RUINChatPanelTraitOverrideParentKey, nil, OBJC_ASSOCIATION_ASSIGN);
+        }
+        return;
+    }
+    if (!parent) return;
+    // Already projected to the phone idiom (by RUIN or natively): nothing to do.
+    if (controller.traitCollection.userInterfaceIdiom == UIUserInterfaceIdiomPhone) return;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    UITraitCollection *phone = [UITraitCollection traitCollectionWithUserInterfaceIdiom:UIUserInterfaceIdiomPhone];
+    UITraitCollection *combined = [UITraitCollection traitCollectionWithTraitsFromCollections:@[controller.traitCollection, phone]];
+    [parent setOverrideTraitCollection:combined forChildViewController:controller];
+#pragma clang diagnostic pop
+    objc_setAssociatedObject(controller, &RUINChatPanelTraitOverrideParentKey, parent, OBJC_ASSOCIATION_ASSIGN);
+    atomic_fetch_add_explicit(&gPanelTraitApplications, 1, memory_order_relaxed);
+}
+%end
+%end
+
+static void RUINInstallChatPanelTraitHooks(void) {
+    if (atomic_load(&gPanelTraitHookInstalled)) return;
+    Class cls = objc_getClass("LineMessagingUI.ChatViewController");
+    if (!cls || ![cls isSubclassOfClass:UIViewController.class]) { gPanelTraitHookStatus = @"missing_class"; return; }
+    Method appear = class_getInstanceMethod(cls, @selector(viewWillAppear:));
+    const char *types = appear ? method_getTypeEncoding(appear) : NULL;
+    if (!types || strcmp(types, "v20@0:8B16")) { gPanelTraitHookStatus = @"abi_mismatch"; return; }
+    %init(RUINChatPanelTraits, RUINChatPanelTraitsController = cls);
+    atomic_store(&gPanelTraitHookInstalled, true);
+    gPanelTraitHookStatus = @"installed";
+}
+
+// Home profile header customization: the avatar container moves to the
+// left, the name/status/music views shift right of it, and the account's
+// own MID is shown small at the bottom-right of the header.
+static char RUINProfileHeaderMIDLabelKey;
+static char RUINProfileHeaderShiftedViewsKey;
+
+static void RUINFindProfileHeaderParts(UIView *view, UIView **container, UIView **decoration)
+{
+    for (UIView *sub in view.subviews) {
+        NSString *cls = NSStringFromClass(sub.class);
+        if ([cls isEqualToString:@"LineHomeTab.ListProfileContainerView"]) *container = sub;
+        else if ([cls containsString:@"EventEffectDarkModeSupportImageView"]) *decoration = sub;
+        RUINFindProfileHeaderParts(sub, container, decoration);
+    }
+}
+
+static void RUINCollectLeftProfileViews(UIView *view, UIView *header, UIView *container, UIView *decoration, UIView *mid, CGRect containerRect, NSMutableArray<UIView *> *outViews)
+{
+    for (UIView *sub in view.subviews) {
+        if (sub == container || sub == decoration || sub == mid) continue;
+        if ([container isDescendantOfView:sub]) {
+            RUINCollectLeftProfileViews(sub, header, container, decoration, mid, containerRect, outViews);
+            continue;
+        }
+        sub.transform = CGAffineTransformIdentity;
+        CGRect rect = [header convertRect:sub.bounds fromView:sub];
+        if (!CGRectIsEmpty(rect) && CGRectGetWidth(rect) > 0 && CGRectGetHeight(rect) > 0 &&
+            CGRectGetMinX(rect) < CGRectGetMinX(containerRect) &&
+            CGRectGetMaxX(rect) <= CGRectGetMinX(containerRect) + 24.0) {
+            [outViews addObject:sub];
+            continue;
+        }
+        RUINCollectLeftProfileViews(sub, header, container, decoration, mid, containerRect, outViews);
+    }
+}
+
+static void RUINResetTrackedProfileViews(UIView *header)
+{
+    NSHashTable<UIView *> *shifted = objc_getAssociatedObject(header, &RUINProfileHeaderShiftedViewsKey);
+    for (UIView *view in shifted) {
+        view.transform = CGAffineTransformIdentity;
+    }
+    [shifted removeAllObjects];
+}
+
+static void RUINTranslateViewInHeader(UIView *header, UIView *view, CGFloat targetX)
+{
+    if (!view.superview) return;
+    view.transform = CGAffineTransformIdentity;
+    CGRect layout = [header convertRect:view.bounds fromView:view];
+    CGFloat dx = targetX - layout.origin.x;
+    if (fabs(dx) > 0.5) view.transform = CGAffineTransformMakeTranslation(dx, 0);
+}
+
+static void RUINApplyProfileHeaderLayout(UIView *header)
+{
+    atomic_fetch_add_explicit(&gProfileHeaderApplyRuns, 1, memory_order_relaxed);
+    RUINResetTrackedProfileViews(header);
+    UIView *container = nil, *decoration = nil;
+    RUINFindProfileHeaderParts(header, &container, &decoration);
+    if (!container) return;
+    atomic_store(&gProfileHeaderFoundContainer, true);
+    container.transform = CGAffineTransformIdentity;
+    if (decoration) decoration.transform = CGAffineTransformIdentity;
+    CGRect containerRect = [header convertRect:container.bounds fromView:container];
+    CGFloat width = CGRectGetWidth(header.bounds);
+    CGFloat textX = 16.0 + CGRectGetWidth(containerRect) + 12.0;
+    UILabel *mid = objc_getAssociatedObject(header, &RUINProfileHeaderMIDLabelKey);
+    NSMutableArray<UIView *> *leftViews = [NSMutableArray array];
+    RUINCollectLeftProfileViews(header, header, container, decoration, mid, containerRect, leftViews);
+    // Frame writes are stomped by LINE's constraint/stack layout, so the
+    // repositioning is a translation transform on top of the laid-out
+    // frame; every pass restarts from identity, keeping it idempotent.
+    RUINTranslateViewInHeader(header, container, 16);
+    if (decoration) decoration.transform = container.transform;
+    NSHashTable<UIView *> *shifted = objc_getAssociatedObject(header, &RUINProfileHeaderShiftedViewsKey);
+    if (!shifted) {
+        shifted = [NSHashTable weakObjectsHashTable];
+        objc_setAssociatedObject(header, &RUINProfileHeaderShiftedViewsKey, shifted, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    [shifted addObject:container];
+    if (decoration) [shifted addObject:decoration];
+    for (UIView *view in leftViews) {
+        RUINTranslateViewInHeader(header, view, textX);
+        [shifted addObject:view];
+    }
+    NSString *account = RUINChatCatalogAccount();
+    if (account.length) {
+        if (!mid) {
+            mid = [UILabel new];
+            mid.font = [UIFont systemFontOfSize:10.5 weight:UIFontWeightMedium];
+            mid.textColor = UIColor.secondaryLabelColor;
+            mid.textAlignment = NSTextAlignmentRight;
+            objc_setAssociatedObject(header, &RUINProfileHeaderMIDLabelKey, mid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [header addSubview:mid];
+        }
+        mid.text = account;
+        mid.frame = CGRectMake(textX, CGRectGetHeight(header.bounds) - 20, MAX(0, width - textX - 16), 14);
+        mid.hidden = NO;
+    } else if (mid) {
+        mid.hidden = YES;
+    }
+}
+
+static void RUINResetProfileHeaderLayout(UIView *header)
+{
+    RUINResetTrackedProfileViews(header);
+    UIView *container = nil, *decoration = nil;
+    RUINFindProfileHeaderParts(header, &container, &decoration);
+    if (container) container.transform = CGAffineTransformIdentity;
+    if (decoration) decoration.transform = CGAffineTransformIdentity;
+    UILabel *mid = objc_getAssociatedObject(header, &RUINProfileHeaderMIDLabelKey);
+    if (mid) mid.hidden = YES;
+}
+
+static void RUINRefreshProfileHeaderViews(void)
+{
+    Class profileClass = objc_getClass("LineHomeTab.MyProfileView");
+    if (!profileClass) return;
+    NSMutableArray<UIView *> *stack = [NSMutableArray array];
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:UIWindowScene.class] ||
+            scene.activationState != UISceneActivationStateForegroundActive) continue;
+        for (UIWindow *window in ((UIWindowScene *)scene).windows)
+            [stack addObject:window];
+    }
+    NSUInteger visited = 0;
+    while (stack.count && visited < 2048) {
+        UIView *view = stack.lastObject;
+        [stack removeLastObject];
+        visited++;
+        if ([view isKindOfClass:profileClass]) {
+            [view setNeedsLayout];
+            [view layoutIfNeeded];
+        }
+        for (UIView *sub in view.subviews)
+            if (visited + stack.count < 2048) [stack addObject:sub];
+    }
+}
+
+%group RUINProfileHeader
+%hook RUINProfileHeaderView
+- (void)layoutSubviews
+{
+    %orig;
+    if (!atomic_load_explicit(&gTargetMatches, memory_order_relaxed)) return;
+    UIView *header = (UIView *)self;
+    if (!atomic_load_explicit(&gProfileHeaderLeftEnabled, memory_order_relaxed)) {
+        RUINResetProfileHeaderLayout(header);
+        return;
+    }
+    RUINApplyProfileHeaderLayout(header);
+    // The constraint engine may lay the header's children out after this
+    // pass; re-apply once on the next main-loop turn so the result sticks.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (atomic_load_explicit(&gProfileHeaderLeftEnabled, memory_order_relaxed) && header.window)
+            RUINApplyProfileHeaderLayout(header);
+    });
+}
+- (void)didMoveToWindow
+{
+    %orig;
+    UIView *header = (UIView *)self;
+    if (!header.window || !atomic_load_explicit(&gTargetMatches, memory_order_relaxed) ||
+        !atomic_load_explicit(&gProfileHeaderLeftEnabled, memory_order_relaxed)) return;
+    RUINApplyProfileHeaderLayout(header);
+}
+%end
+%end
+
+static void RUINInstallProfileHeaderHooks(void)
+{
+    if (atomic_load(&gProfileHeaderHookInstalled)) return;
+    Class cls = objc_getClass("LineHomeTab.MyProfileView");
+    if (!cls || ![cls isSubclassOfClass:UIView.class]) { gProfileHeaderHookStatus = @"missing_class"; return; }
+    Method layout = class_getInstanceMethod(cls, @selector(layoutSubviews));
+    Method window = class_getInstanceMethod(cls, @selector(didMoveToWindow));
+    const char *layoutTypes = layout ? method_getTypeEncoding(layout) : NULL;
+    const char *windowTypes = window ? method_getTypeEncoding(window) : NULL;
+    if (!layoutTypes || strcmp(layoutTypes, "v16@0:8") || !windowTypes || strcmp(windowTypes, "v16@0:8")) {
+        gProfileHeaderHookStatus = @"abi_mismatch";
+        return;
+    }
+    %init(RUINProfileHeader, RUINProfileHeaderView = cls);
+    atomic_store(&gProfileHeaderHookInstalled, true);
+    gProfileHeaderHookStatus = @"installed";
+    if (atomic_load_explicit(&gProfileHeaderLeftEnabled, memory_order_relaxed))
+        RUINRefreshProfileHeaderViews();
+}
+
 // SmartChannel shares a slot across ads, news and placeholders. The ad switch
 // controls this exact Talk-top region, independent of its current payload.
 static BOOL RUINTalkTopBannerShouldCollapse(UIView *view)
@@ -1465,6 +1858,9 @@ static void RUINInstallHooks(void)
 {
     RUINInstallTalkTopBannerHooks();
     RUINInstallTalkInsetHooks();
+    RUINInstallPanelHeightHooks();
+    RUINInstallChatPanelTraitHooks();
+    RUINInstallProfileHeaderHooks();
     if (!gTabConfigurationHookInstalled) {
         Class delegate = objc_getClass("_TtC4LINE11AppDelegate");
         Method method = delegate ? class_getInstanceMethod(delegate,
@@ -2056,11 +2452,16 @@ static NSUInteger RUINLoadPreferences(void)
     BOOL recommendations = [defaults boolForKey:RUINHideRecommendationsDefaultsKey];
     BOOL voice = [defaults boolForKey:RUINHideVoiceInputDefaultsKey];
     BOOL agent = [defaults boolForKey:RUINHideAgentIBarDefaultsKey];
+    [defaults registerDefaults:@{RUINFixPanelHeightDefaultsKey: @YES}];
+    BOOL panel = [defaults boolForKey:RUINFixPanelHeightDefaultsKey];
+    BOOL profileHeader = [defaults boolForKey:RUINProfileHeaderLeftDefaultsKey];
     atomic_store(&gHideAdsEnabled, ads);
     atomic_store(&gHideRecommendationsEnabled, recommendations);
     atomic_store(&gHideVoiceInputEnabled, voice);
     atomic_store(&gHideAgentIEnabled, agent);
-    return ads | (recommendations << 1) | (voice << 2) | (agent << 3);
+    atomic_store(&gFixPanelHeightEnabled, panel);
+    atomic_store(&gProfileHeaderLeftEnabled, profileHeader);
+    return ads | (recommendations << 1) | (voice << 2) | (agent << 3) | (panel << 4) | (profileHeader << 5);
 }
 
 static void RUINPerformInstallOrRefresh(void)
@@ -2102,7 +2503,11 @@ void RUINInstallInterfaceFeatures(void)
 
 void RUINRefreshInterfaceFeatures(void)
 {
-    RUINOnMain(^{ RUINPerformInstallOrRefresh(); });
+    RUINOnMain(^{
+        RUINPerformInstallOrRefresh();
+        if (atomic_load(&gProfileHeaderHookInstalled))
+            RUINRefreshProfileHeaderViews();
+    });
 }
 
 static NSArray<NSString *> *RUINNativeTabIdentifiersOnMain(BOOL includeHiddenChoices)
@@ -2236,6 +2641,13 @@ NSDictionary *RUINInterfaceDiagnostics(void)
         startup == 3 ? @"invalid_selection" : startup == 4 ? @"unavailable_or_hidden" : @"pending";
     return @{
         @"gate": gated ? @"version_gated" : installedForTarget ? @"matched" : @"pending",
+        @"profileHeader": @{
+            @"enabled": @(atomic_load(&gProfileHeaderLeftEnabled)),
+            @"hook": gProfileHeaderHookStatus ?: @"pending",
+            @"accountAvailable": @(RUINChatCatalogAccount().length > 0),
+            @"applyRuns": @(atomic_load(&gProfileHeaderApplyRuns)),
+            @"containerFound": @(atomic_load(&gProfileHeaderFoundContainer)),
+        },
         @"visibleViewScans": @(atomic_load(&gVisibleViewScans)),
         @"visibleViewScanSkips": @(atomic_load(&gVisibleViewScanSkips)),
         @"tabs": @{
@@ -2291,6 +2703,14 @@ NSDictionary *RUINInterfaceDiagnostics(void)
             @"heightHookInstalled": @(gAgentIntrinsicInstalled),
             @"hookCalls": @(RUINViewHookCalls(RUINHideGroupAgentI)),
             @"hookFailures": RUINViewHookFailures(RUINHideGroupAgentI)
+        },
+        @"panelHeight": @{
+            @"status": gated ? @"version_gated" : gPanelHeightHookStatus,
+            @"enabled": @(atomic_load(&gFixPanelHeightEnabled)),
+            @"applications": @(atomic_load(&gPanelHeightApplications)),
+            @"lastTargetHeight": @(gPanelLastTargetHeight),
+            @"traitStatus": gated ? @"version_gated" : gPanelTraitHookStatus,
+            @"traitApplications": @(atomic_load(&gPanelTraitApplications))
         }
     };
 }

@@ -8,4 +8,6 @@ FOUNDATION_EXPORT void RUINRefreshSettingsFeatures(void);
 FOUNDATION_EXPORT void RUINRefreshSettingsFeature(NSString *key);
 FOUNDATION_EXPORT void RUINOpenSettingsInLINE(UIViewController *owner);
 FOUNDATION_EXPORT BOOL RUINPresentSettings(void);
+FOUNDATION_EXPORT void RUINPresentFirstRunSetupIfNeeded(UIViewController *presenter);
+FOUNDATION_EXPORT void RUINPresentSetup(UIViewController *presenter);
 FOUNDATION_EXPORT BOOL RUINMaybeShowCompatibilityWarning(void);

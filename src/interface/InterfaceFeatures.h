@@ -14,6 +14,8 @@ FOUNDATION_EXPORT NSString * const RUINHideAdsDefaultsKey;
 FOUNDATION_EXPORT NSString * const RUINHideRecommendationsDefaultsKey;
 FOUNDATION_EXPORT NSString * const RUINHideVoiceInputDefaultsKey;
 FOUNDATION_EXPORT NSString * const RUINHideAgentIBarDefaultsKey;
+FOUNDATION_EXPORT NSString * const RUINFixPanelHeightDefaultsKey;
+FOUNDATION_EXPORT NSString * const RUINProfileHeaderLeftDefaultsKey;
 
 /** RUINStartupTabDefaultsKey stores one of these IDs; fixed startup selection defaults off. */
 FOUNDATION_EXPORT NSString * const RUINInterfaceTabHome;

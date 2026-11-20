@@ -221,7 +221,7 @@ def main():
     state = source[source.index("static Class gTalkTopBannerClass"):source.index("static atomic_int gStartupStatus")]
     top_hooks = source[source.index("// SmartChannel shares a slot"):source.index("static BOOL RUINPrepareMethodHook(")]
     inset_hooks = source[source.index("// Native page layout computes list insets"):source.index("static void RUINInstallViewTargetHooks(")]
-    top_install = source[source.index("static BOOL RUINIsUIViewSubclass("):source.index("static void RUINMarkHooksVersionGated(")]
+    top_install = source[source.index("static BOOL RUINIsUIViewSubclass(Class cls)\n"):source.index("static void RUINMarkHooksVersionGated(")]
     with tempfile.TemporaryDirectory(prefix="ruin-talk-insets-") as temporary:
         directory = Path(temporary)
         logos = directory / "check.x"

@@ -8,6 +8,7 @@
 #import "ThemeVersion.h"
 #import "ThemeProductIdentity.h"
 #import "../core/Localization.h"
+#import "../core/StartupProfiler.h"
 #import "RuntimeInspector.h"
 #import "ThemeApplyEvent.h"
 #import "NativeThemeValidation.h"
@@ -1050,10 +1051,10 @@ static id RUINThemeFeatureAddress(RUINMappingStatus status, uintptr_t address)
 void RUINInstallThemeFeatures(void)
 {
     os_unfair_lock_lock(&gThemeInstallLock);
-    RUINInstallThemePriceTierHook();
-    RUINInstallThemeApplyObserver();
-    RUINInstallThemeApplyFailureObserver();
-    RUINInstallNativeThemeValidation();
+    RUIN_PROFILE_CALL("theme.install_price_tier_hook", RUINInstallThemePriceTierHook());
+    RUIN_PROFILE_CALL("theme.install_apply_observer", RUINInstallThemeApplyObserver());
+    RUIN_PROFILE_CALL("theme.install_apply_failure_observer", RUINInstallThemeApplyFailureObserver());
+    RUIN_PROFILE_CALL("theme.install_native_validation", RUINInstallNativeThemeValidation());
     atomic_store(&gThemeDefaultsFreezeStatus, RUINThemeHookNativeSchedulingPreserved);
     atomic_store_explicit(&gThemeInstallInvoked, true, memory_order_release);
     os_unfair_lock_unlock(&gThemeInstallLock);

@@ -6,6 +6,7 @@
 #import "MessageHistory.h"
 #import "RetainedMedia.h"
 #import "../core/Localization.h"
+#import "../core/StartupProfiler.h"
 #import "../core/TargetMetadata.h"
 #import "../known/MessagingMappings.h"
 #import "../known/FeatureImage.h"
@@ -95,39 +96,53 @@ static BOOL VerifyCode(void) {
         // No dyld rescan or new loader reference on repeated installs. A later
         // failure gates use but cannot discard the proof backing live hooks.
         imageResolution = @"retainedProofRejected";
-        if (unsendImageVersion != versionMapping ||
-            !RUINFeatureImageMatches(&unsendImage, &versionMapping->host)) return NO;
+        if (unsendImageVersion != versionMapping) return NO;
+        RUIN_PROFILE_BEGIN("unsend_verify.image_matches");
+        BOOL retainedMatches = RUINFeatureImageMatches(&unsendImage, &versionMapping->host);
+        RUIN_PROFILE_END(retainedMatches ? RUINProfileStatusOK : RUINProfileStatusFailed);
+        if (!retainedMatches) return NO;
         imageResolution = @"retainedProof";
+        RUIN_PROFILE_BEGIN("unsend_verify.verify_instructions");
         imageFingerprintVerified = RUINVerifyFeatureInstructions(&unsendImage,
             operation->parserAnchors, operation->parserAnchorCount);
+        RUIN_PROFILE_END(imageFingerprintVerified ? RUINProfileStatusOK : RUINProfileStatusFailed);
         return imageFingerprintVerified;
     }
     RUINFeatureImage candidate = {0};
     // Require the shared owner/path/UUID/CPU and lifetime proof even when the
     // strict main resolver succeeds: LC can rewrite a converted guest's type
     // to MH_EXECUTE, which alone does not prove process lifetime.
-    if (!RUINResolveFeatureImage(&versionMapping->host, objc_getClass("LineOperation"), &candidate)) {
+    RUIN_PROFILE_BEGIN("unsend_verify.resolve_image");
+    BOOL imageResolved = RUINResolveFeatureImage(&versionMapping->host, objc_getClass("LineOperation"), &candidate);
+    RUIN_PROFILE_END(imageResolved ? RUINProfileStatusOK : RUINProfileStatusFailed);
+    if (!imageResolved) {
         imageResolution = RUINFeatureImageResolutionStatus();
         return NO;
     }
     imageResolution = @"featureImageResolved";
+    RUIN_PROFILE_BEGIN("unsend_verify.image_matches");
     BOOL identityMatches = RUINFeatureImageMatches(&candidate, &versionMapping->host);
+    RUIN_PROFILE_END(identityMatches ? RUINProfileStatusOK : RUINProfileStatusFailed);
     const RUINVersionMapping *nativeVersion = RUINCurrentMapping();
     if (nativeVersion) {
         // Preserve all of the existing strict native/sideload checks. A native
         // fingerprint failure must not fall through to the converted route.
         RUINMainExecutableImage nativeImage;
         imageResolution = @"nativeImageRejected";
+        RUIN_PROFILE_BEGIN("unsend_verify.native_chain");
         imageFingerprintVerified = identityMatches && nativeVersion == versionMapping &&
             RUINResolveMainExecutableImage(&nativeImage) &&
             nativeImage.header == candidate.image.header && nativeImage.slide == candidate.image.slide &&
             RUINCurrentMapping() == versionMapping &&
             RUINVerifyInstructions(nativeImage.header, nativeImage.slide,
                 operation->parserAnchors, operation->parserAnchorCount);
+        RUIN_PROFILE_END(imageFingerprintVerified ? RUINProfileStatusOK : RUINProfileStatusFailed);
         if (imageFingerprintVerified) imageResolution = @"nativeProcessImage";
     } else {
+        RUIN_PROFILE_BEGIN("unsend_verify.verify_instructions");
         imageFingerprintVerified = identityMatches &&
             RUINVerifyFeatureInstructions(&candidate, operation->parserAnchors, operation->parserAnchorCount);
+        RUIN_PROFILE_END(imageFingerprintVerified ? RUINProfileStatusOK : RUINProfileStatusFailed);
     }
     if (!imageFingerprintVerified || !TargetMatches() ||
         RUINMappingForInfo(NSBundle.mainBundle.infoDictionary) != versionMapping) {
@@ -464,14 +479,18 @@ static void InstallOperationHook(Class cls, const char *name, const char *encodi
 void RUINInstallUnsendOperation(void) {
     os_unfair_lock_lock(&installLock);
     @try {
+        RUIN_PROFILE_BEGIN("unsend.verify_code");
         BOOL valid = VerifyCode();
+        RUIN_PROFILE_END(valid ? RUINProfileStatusOK : RUINProfileStatusFailed);
         atomic_store(&codeVerified, valid);
         if (!valid) {
             if (atomic_load(&fetchStatus) != OperationHookInstalled) atomic_store(&fetchStatus, OperationHookGated);
             if (atomic_load(&displayStatus) != OperationHookInstalled) atomic_store(&displayStatus, OperationHookGated);
             if (atomic_load(&param1Status) != OperationHookInstalled) atomic_store(&param1Status, OperationHookGated);
+            RUIN_PROFILE_INSTANT("unsend.hooks_gated", RUINProfileStatusSkipped);
             return;
         }
+        RUIN_PROFILE_BEGIN("unsend.install_hooks");
         InstallOperationHook(NSManagedObjectContext.class, "executeFetchRequest:error:", "@32@0:8@16^@24", &fetchStatus, ^(__unused Class cls) {
             %init(RUINUnsendFetch);
         });
@@ -481,6 +500,7 @@ void RUINInstallUnsendOperation(void) {
         InstallOperationHook(objc_getClass("LineOperation"), "param1", "@16@0:8", &param1Status, ^(Class cls) {
             %init(RUINUnsendParam1, RUINUnsendParsedOperation = cls);
         });
+        RUIN_PROFILE_END(RUINProfileStatusOK);
     } @finally { os_unfair_lock_unlock(&installLock); }
 }
 __attribute__((constructor)) static void EarlyUnsendOperation(void) { @autoreleasepool { RUINInstallUnsendOperation(); } }

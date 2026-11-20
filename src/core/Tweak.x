@@ -10,6 +10,7 @@
 #import "SiriCompatibility.h"
 #import "Localization.h"
 #import "RUINSettings.h"
+#import "StartupProfiler.h"
 #import "SecondaryLogin.h"
 #import "InterfaceFeatures.h"
 #import "Confirmations.h"
@@ -82,6 +83,7 @@ BOOL RUINIsCompatible(void) {
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)options
 {
     BOOL result = %orig(application, options);
+    RUIN_PROFILE_INSTANT("launch.did_finish_launching", RUINProfileStatusOK);
     // Install after LINE assigns its delegate and before launch returns, so a
     // cold notification tap cannot enter LINE's remote-push parser.
     if (result) RUINInstallLocalNotifications();
@@ -289,6 +291,18 @@ void RUINRefreshSettingsFeatures(void) {
     RUINRefreshRuntimeReport();
 }
 
+static BOOL RUINHandleDebugSettingsFeature(NSString *key) {
+#if RUIN_DEBUG
+    if ([key isEqual:RUINUIExtractButtonEnabledDefaultsKey]) {
+        RUINRefreshUIExtractButton();
+        return YES;
+    }
+#else
+    (void)key;
+#endif
+    return NO;
+}
+
 void RUINRefreshSettingsFeature(NSString *key) {
     if (!key.length) return;
     if (!NSThread.isMainThread) {
@@ -296,6 +310,7 @@ void RUINRefreshSettingsFeature(NSString *key) {
         dispatch_async(dispatch_get_main_queue(), ^{ RUINRefreshSettingsFeature(copiedKey); });
         return;
     }
+    if (RUINHandleDebugSettingsFeature(key)) return;
     if ([key isEqual:RUINClearViewedUnreadBadgesDefaultsKey]) {
         RUINInstallLocalUnreadBadges();
     } else if ([key isEqual:RUINLegacyHomeEnabledDefaultsKey]) {
@@ -333,7 +348,8 @@ void RUINRefreshSettingsFeature(NSString *key) {
     } else if ([key isEqual:RUINCopyStickerGIFEnabledDefaultsKey]) {
         RUINInstallMenuExtras();
     } else if ([@[RUINHideAdsDefaultsKey, RUINHideRecommendationsDefaultsKey,
-           RUINHideVoiceInputDefaultsKey, RUINHideAgentIBarDefaultsKey] containsObject:key]) {
+           RUINHideVoiceInputDefaultsKey, RUINHideAgentIBarDefaultsKey,
+           RUINFixPanelHeightDefaultsKey, RUINProfileHeaderLeftDefaultsKey] containsObject:key]) {
         RUINRefreshInterfaceFeatures();
     } else if (![@[RUINHideVOOMTabDefaultsKey, RUINHideWalletTabDefaultsKey,
            RUINHideShoppingTabDefaultsKey, RUINHideNewsCallTabsDefaultsKey,
@@ -359,13 +375,14 @@ static void RUINMaybeScheduleEnvironmentSettings(void) {
 }
 
 static void RUINApplicationDidBecomeActive(void) {
+    RUINStartupProfileMarkActive();
     if (RUINIsCompatible()) {
-        RUINInstallLegacyMessagingConfiguration();
-        RUINInstallLocalNotifications();
-        RUINInstallLocalAppearance();
-        RUINInstallLocalFont();
-        RUINInstallLocalFontHooks();
-        RUINInstallNativeMuteSend();
+        RUIN_PROFILE_CALL("activate.legacy_messaging_configuration", RUINInstallLegacyMessagingConfiguration());
+        RUIN_PROFILE_CALL("activate.local_notifications", RUINInstallLocalNotifications());
+        RUIN_PROFILE_CALL("activate.local_appearance", RUINInstallLocalAppearance());
+        RUIN_PROFILE_CALL("activate.local_font", RUINInstallLocalFont());
+        RUIN_PROFILE_CALL("activate.local_font_hooks", RUINInstallLocalFontHooks());
+        RUIN_PROFILE_CALL("activate.native_mute_send", RUINInstallNativeMuteSend());
     }
     static BOOL selfTestAttempted;
     if (!selfTestAttempted && [NSProcessInfo.processInfo.environment[@"RUIN_SELF_TEST"] isEqualToString:@"1"]) {
@@ -377,76 +394,89 @@ static void RUINApplicationDidBecomeActive(void) {
         RUINLocalNamesDefaultsKey: @{}
     }];
     if (RUINIsCompatible()) {
-        RUINInstallSiriCompatibility();
-        RUINRefreshFeaturesOnActivation(RUINChatCatalogAccount());
-        RUINInstallReadBoundary();
-        RUINInstallNativeEntry();
-        RUINInstallSecondaryLogin();
-        RUINInstallLegacyHome();
-        RUINInstallReadOnReply();
-        RUINInstallAutomaticReadGate();
-        RUINInstallThemeFeatures();
-        RUINInstallThemeStoreDownload();
-        RUINInstallThemeStoreImages();
-        RUINInstallNativeThemeImages();
-        RUINInstallNativeThemeWorkflow();
-        RUINInstallThemeStoreWeb();
-        RUINInstallInterfaceFeatures();
-        RUINInstallConfirmations();
-        RUINInstallMessageHistory();
-        RUINInstallUnsendRetention();
-        RUINInstallRetainedMedia();
-        RUINInstallUnsendOperation();
-        RUINInstallUnsendMarkerUI();
-        RUINInstallAgeVerification();
-        RUINInstallMenuExtras();
-        RUINInstallNativeChatControls();
-        RUINInstallLocalUnreadBadges();
-        InstallRuntimeInspector();
+        RUIN_PROFILE_CALL("activate.siri_compatibility", RUINInstallSiriCompatibility());
+        RUIN_PROFILE_CALL("activate.refresh_features_on_activation", RUINRefreshFeaturesOnActivation(RUINChatCatalogAccount()));
+        RUIN_PROFILE_CALL("activate.read_boundary", RUINInstallReadBoundary());
+        RUIN_PROFILE_CALL("activate.native_entry", RUINInstallNativeEntry());
+        RUIN_PROFILE_CALL("activate.secondary_login", RUINInstallSecondaryLogin());
+        RUIN_PROFILE_CALL("activate.legacy_home", RUINInstallLegacyHome());
+        RUIN_PROFILE_CALL("activate.read_on_reply", RUINInstallReadOnReply());
+        RUIN_PROFILE_CALL("activate.automatic_read_gate", RUINInstallAutomaticReadGate());
+        RUIN_PROFILE_CALL("activate.theme_features", RUINInstallThemeFeatures());
+        RUIN_PROFILE_CALL("activate.theme_store_download", RUINInstallThemeStoreDownload());
+        RUIN_PROFILE_CALL("activate.theme_store_images", RUINInstallThemeStoreImages());
+        RUIN_PROFILE_CALL("activate.native_theme_images", RUINInstallNativeThemeImages());
+        RUIN_PROFILE_CALL("activate.native_theme_workflow", RUINInstallNativeThemeWorkflow());
+        RUIN_PROFILE_CALL("activate.theme_store_web", RUINInstallThemeStoreWeb());
+        RUIN_PROFILE_CALL("activate.interface_features", RUINInstallInterfaceFeatures());
+        RUIN_PROFILE_CALL("activate.confirmations", RUINInstallConfirmations());
+        RUIN_PROFILE_CALL("activate.message_history", RUINInstallMessageHistory());
+        RUIN_PROFILE_CALL("activate.unsend_retention", RUINInstallUnsendRetention());
+        RUIN_PROFILE_CALL("activate.retained_media", RUINInstallRetainedMedia());
+        RUIN_PROFILE_CALL("activate.unsend_operation", RUINInstallUnsendOperation());
+        RUIN_PROFILE_CALL("activate.unsend_marker_ui", RUINInstallUnsendMarkerUI());
+        RUIN_PROFILE_CALL("activate.age_verification", RUINInstallAgeVerification());
+        RUIN_PROFILE_CALL("activate.menu_extras", RUINInstallMenuExtras());
+        RUIN_PROFILE_CALL("activate.native_chat_controls", RUINInstallNativeChatControls());
+        RUIN_PROFILE_CALL("activate.local_unread_badges", RUINInstallLocalUnreadBadges());
+        RUIN_PROFILE_CALL("activate.runtime_inspector", InstallRuntimeInspector());
+#if RUIN_DEBUG
+        RUIN_PROFILE_CALL("activate.ui_extract_button", RUINInstallUIExtractionButton());
+#endif
     }
     RUINMaybeScheduleEnvironmentSettings();
     RUINRefreshRuntimeReport();
     RUINMaybeShowCompatibilityWarning();
+    RUINStartupProfileFinishActivation();
 }
 
 __attribute__((constructor)) static void RUINConstructor(void) {
     @autoreleasepool {
-        RUINInstallBundleIdentity();
+        RUINStartupProfileBeginLaunch();
+        RUIN_PROFILE_CALL("install.bundle_identity", RUINInstallBundleIdentity());
         if (RUINIsCompatible()) {
-            RUINInstallSiriCompatibility();
+            RUIN_PROFILE_CALL("install.siri_compatibility", RUINInstallSiriCompatibility());
             // Establish storage and the native visibility boundary before any
             // LINE singleton can cache the root menu during feature setup.
-            RUINInstallCompatibility();
-            RUINInstallKeychainCompatibility();
-            RUINInstallNativeTabAvailability();
+            RUIN_PROFILE_CALL("install.sideload_compatibility", RUINInstallCompatibility());
+            RUIN_PROFILE_CALL("install.keychain_compatibility", RUINInstallKeychainCompatibility());
+            RUIN_PROFILE_CALL("install.native_tab_availability", RUINInstallNativeTabAvailability());
             NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+            RUIN_PROFILE_BEGIN("constructor.defaults_migration");
             if (![defaults objectForKey:RUINLegacyMessagingEnabledDefaultsKey])
                 [defaults setBool:[defaults boolForKey:RUINLocalLYPEnabledDefaultsKey]
                     forKey:RUINLegacyMessagingEnabledDefaultsKey];
-            RUINInstallSecondaryLogin();
-            RUINInstallLegacyHome();
-            RUINInstallClientVersionAdvertisement();
-            RUINInstallChatCatalog();
-            RUINInstallLegacyMessagingConfiguration();
-            RUINInstallLocalFont();
-            RUINInstallLocalFontHooks();
-            RUINInstallLocalNotificationLaunchBoundary();
+            RUIN_PROFILE_END(RUINProfileStatusOK);
+            RUIN_PROFILE_CALL("install.secondary_login", RUINInstallSecondaryLogin());
+            RUIN_PROFILE_CALL("install.legacy_home", RUINInstallLegacyHome());
+            RUIN_PROFILE_CALL("install.client_version_advertisement", RUINInstallClientVersionAdvertisement());
+            RUIN_PROFILE_CALL("install.chat_catalog", RUINInstallChatCatalog());
+            RUIN_PROFILE_CALL("install.legacy_messaging_configuration", RUINInstallLegacyMessagingConfiguration());
+            RUIN_PROFILE_CALL("install.local_font", RUINInstallLocalFont());
+            RUIN_PROFILE_CALL("install.local_font_hooks", RUINInstallLocalFontHooks());
+            RUIN_PROFILE_CALL("install.local_notification_launch_boundary", RUINInstallLocalNotificationLaunchBoundary());
             [NSUserDefaults.standardUserDefaults removeObjectForKey:@"RUINMessageMarkdownEnabled"];
-            RUINPrepareNativeReadRangeProbe();
-            RUINInstallFeatures();
-            RUINInstallReadBoundary();
-            RUINInstallReadOnReply();
+            RUIN_PROFILE_CALL("install.native_read_range_probe", RUINPrepareNativeReadRangeProbe());
+            RUIN_PROFILE_CALL("install.features", RUINInstallFeatures());
+            RUIN_PROFILE_CALL("install.read_boundary", RUINInstallReadBoundary());
+            RUIN_PROFILE_CALL("install.read_on_reply", RUINInstallReadOnReply());
             // Native theme validation and range decoding can run before the
             // application becomes active. Install their data hooks now; the
             // visible management screens still initialize on the normal path.
-            RUINInstallThemeFeatures();
-            RUINInstallNativeThemeRegistrationCapture();
-            RUINInstallMessageHistory();
-            RUINInstallReadUsersEvents();
-            InstallRuntimeInspector();
-            RUINInstallAutomaticReadGate();
-            RUINInstallNativeEntry();
+            RUIN_PROFILE_CALL("install.theme_features", RUINInstallThemeFeatures());
+            RUIN_PROFILE_CALL("install.native_theme_registration_capture", RUINInstallNativeThemeRegistrationCapture());
+            RUIN_PROFILE_CALL("install.message_history", RUINInstallMessageHistory());
+            RUIN_PROFILE_CALL("install.read_users_events", RUINInstallReadUsersEvents());
+            RUIN_PROFILE_CALL("install.runtime_inspector", InstallRuntimeInspector());
+#if RUIN_DEBUG
+            RUIN_PROFILE_CALL("install.ui_extract_button", RUINInstallUIExtractionButton());
+#endif
+            RUIN_PROFILE_CALL("install.automatic_read_gate", RUINInstallAutomaticReadGate());
+            RUIN_PROFILE_CALL("install.native_entry", RUINInstallNativeEntry());
+        } else {
+            RUIN_PROFILE_INSTANT("constructor.incompatible_host", RUINProfileStatusSkipped);
         }
+        RUINStartupProfileFinishConstructor();
     }
     dispatch_async(dispatch_get_main_queue(), ^{
         static dispatch_once_t once;

@@ -118,8 +118,40 @@ void RUINTestRegisterFuncForAddImage(void (*callback)(const struct mach_header *
 - (id)accessibilityElementAtIndex:(NSInteger)index { return self.fixtureAccessibilityElements[(NSUInteger)index]; }
 - (id)accessibilityHitTest:(__unused CGPoint)point withEvent:(__unused id)event { return nil; }
 @end
+static NSUInteger firstRunSetupCalls;
+void RUINPresentFirstRunSetupIfNeeded(__unused UIViewController *presenter) { firstRunSetupCalls++; }
+
+@implementation CALayer @end
+@implementation UIFont
++ (instancetype)systemFontOfSize:(__unused CGFloat)fontSize weight:(__unused UIFontWeight)weight { return [self new]; }
+@end
+@implementation UIColor
++ (instancetype)whiteColor { static UIColor *c; if (!c) c = [self new]; return c; }
++ (instancetype)blackColor { static UIColor *c; if (!c) c = [self new]; return c; }
++ (instancetype)systemBackgroundColor { static UIColor *c; if (!c) c = [self new]; return c; }
++ (instancetype)labelColor { static UIColor *c; if (!c) c = [self new]; return c; }
++ (instancetype)separatorColor { static UIColor *c; if (!c) c = [self new]; return c; }
++ (instancetype)colorWithWhite:(__unused CGFloat)white alpha:(__unused CGFloat)alpha { return [self new]; }
+- (CGColorRef)CGColor { return NULL; }
+@end
+@implementation NSLayoutConstraint
++ (void)activateConstraints:(__unused NSArray<NSLayoutConstraint *> *)constraints {}
+@end
+@implementation NSLayoutAnchor
+- (NSLayoutConstraint *)constraintEqualToAnchor:(__unused NSLayoutAnchor *)anchor { return [NSLayoutConstraint new]; }
+- (NSLayoutConstraint *)constraintEqualToAnchor:(__unused NSLayoutAnchor *)anchor constant:(__unused CGFloat)c { return [NSLayoutConstraint new]; }
+@end
+@implementation NSLayoutDimension
+- (NSLayoutConstraint *)constraintEqualToConstant:(__unused CGFloat)c { return [NSLayoutConstraint new]; }
+@end
+@implementation UILayoutGuide
+- (instancetype)init { if ((self = [super init])) { _leadingAnchor = [NSLayoutAnchor new]; _trailingAnchor = [NSLayoutAnchor new]; _bottomAnchor = [NSLayoutAnchor new]; } return self; }
+@end
+@implementation UILabel @end
+
 @implementation UIView
-- (instancetype)init { if ((self = [super init])) { _alpha = 1; _subviews = @[]; _gestureRecognizers = [NSMutableArray array]; } return self; }
+- (instancetype)init { if ((self = [super init])) { _alpha = 1; _subviews = @[]; _gestureRecognizers = [NSMutableArray array]; _layer = [CALayer new]; _translatesAutoresizingMaskIntoConstraints = YES; _safeAreaLayoutGuide = [UILayoutGuide new]; _leadingAnchor = [NSLayoutAnchor new]; _trailingAnchor = [NSLayoutAnchor new]; _topAnchor = [NSLayoutAnchor new]; _bottomAnchor = [NSLayoutAnchor new]; _heightAnchor = [NSLayoutDimension new]; } return self; }
+- (void)addSubview:(UIView *)view { view.superview = self; self.subviews = [self.subviews arrayByAddingObject:view]; }
 - (void)addGestureRecognizer:(UIGestureRecognizer *)recognizer { recognizer.view = self; [self.gestureRecognizers addObject:recognizer]; }
 - (id)accessibilityHitTest:(CGPoint)point withEvent:(__unused id)event {
     id hit = self.fixtureAccessibilityHit;
@@ -131,6 +163,13 @@ void RUINTestRegisterFuncForAddImage(void (*callback)(const struct mach_header *
 @implementation UIControl
 - (NSSet *)allTargets { return self.actionOwner ? [NSSet setWithObject:self.actionOwner] : [NSSet set]; }
 - (NSArray *)actionsForTarget:(id)target forControlEvent:(UIControlEvents)event { return target == self.actionOwner && event == UIControlEventTouchUpInside ? @[@"loginButtonAction"] : @[]; }
+- (void)addTarget:(id)target action:(SEL)action forControlEvents:(UIControlEvents)controlEvents { self.addedTarget = target; self.addedAction = action; self.addedEvents = controlEvents; }
+@end
+@implementation UIButton
++ (instancetype)buttonWithType:(__unused UIButtonType)buttonType { return [self new]; }
+- (instancetype)init { if ((self = [super init])) _titleLabel = [UILabel new]; return self; }
+- (void)setTitle:(NSString *)title forState:(__unused UIControlState)state { self.currentTitle = title; }
+- (void)setTitleColor:(__unused UIColor *)color forState:(__unused UIControlState)state {}
 @end
 static NSUInteger deviceQueries;
 static UIUserInterfaceIdiom physicalIdiom, lifecycleIdiom, actionIdiom;
@@ -240,6 +279,8 @@ BOOL RUINKeychainCompatibilityReady(void) { return keychainReady; }
 - (void)showRegistrationFlowButtonPressed;
 - (void)ruin_loginTap:(UITapGestureRecognizer *)recognizer;
 - (void)ruin_chooseLoginMode:(UILongPressGestureRecognizer *)recognizer;
+- (void)ruin_secondaryLoginTapped;
+- (void)ruin_backToPrimaryLogin;
 @end
 @interface RUINFixtureSwiftUINode : NSObject
 @property(nonatomic, copy) NSString *accessibilityIdentifier;
@@ -736,5 +777,68 @@ int main(int argc, const char **argv) { @autoreleasepool {
     assert([lastPresentedAlertTitle isEqual:@"ログイン方法を切り替えました"]);
     assert(syncCountAtLastAlertPresentation == fixtureSynchronizeCount); // Persisted before the restart notice.
     assert([defaults.values[@"nativeRole"] isEqual:@"primary"] && defaults.values.count == 2);
+
+    // Direct secondary login button on Welcome and primary-return button on secondary login.
+    assert(firstRunSetupCalls > 0);
+    UIButton *secondaryButton = nil;
+    for (UIView *subview in welcome.view.subviews) {
+        if ([subview isKindOfClass:UIButton.class]) secondaryButton = (UIButton *)subview;
+    }
+    assert(secondaryButton && !secondaryButton.translatesAutoresizingMaskIntoConstraints);
+    assert(secondaryButton.addedTarget == welcome && secondaryButton.addedAction == sel_registerName("ruin_secondaryLoginTapped"));
+    RUINAttachSecondaryLoginButton(welcome);
+    NSUInteger buttonCount = 0;
+    for (UIView *subview in welcome.view.subviews) {
+        if ([subview isKindOfClass:UIButton.class]) buttonCount++;
+    }
+    assert(buttonCount == 1);
+
+    NSUInteger loginBeforeTap = loginCalls;
+    NSUInteger syncBeforeTap = fixtureSynchronizeCount;
+    [defaults setBool:NO forKey:RUINSecondaryLoginEnabledKey];
+    lastPresentedAlertTitle = nil;
+    [(id<RUINSecondaryFixtureActions>)welcome ruin_secondaryLoginTapped];
+    assert([defaults boolForKey:RUINSecondaryLoginEnabledKey]);
+    if (enabled) {
+        assert(loginCalls == loginBeforeTap + 1);
+    } else {
+        assert(loginCalls == loginBeforeTap);
+        assert(fixtureSynchronizeCount == syncBeforeTap + 1);
+        DrainMainQueue();
+        assert([lastPresentedAlertTitle isEqual:@"ログイン方法を切り替えました"]);
+        welcome.presentedViewController = nil;
+    }
+    storageReady = NO;
+    [(id<RUINSecondaryFixtureActions>)welcome ruin_secondaryLoginTapped];
+    assert(loginCalls == (enabled ? loginBeforeTap + 1 : loginBeforeTap));
+    storageReady = YES;
+    welcome.presentedViewController = nil;
+    [defaults setBool:enabled forKey:RUINSecondaryLoginEnabledKey];
+
+    UIButton *returnButton = nil;
+    for (UIView *subview in secondary.view.subviews) {
+        if ([subview isKindOfClass:UIButton.class]) returnButton = (UIButton *)subview;
+    }
+    assert(returnButton && !returnButton.translatesAutoresizingMaskIntoConstraints);
+    assert(returnButton.addedTarget == secondary && returnButton.addedAction == sel_registerName("ruin_backToPrimaryLogin"));
+    RUINAttachPrimaryReturnButton(secondary);
+    NSUInteger returnButtonCount = 0;
+    for (UIView *subview in secondary.view.subviews) {
+        if ([subview isKindOfClass:UIButton.class]) returnButtonCount++;
+    }
+    assert(returnButtonCount == 1);
+
+    NSUInteger primaryBeforeBack = primaryDeviceLoginCalls;
+    lastPresentedAlertTitle = nil;
+    [(id<RUINSecondaryFixtureActions>)secondary ruin_backToPrimaryLogin];
+    if (enabled) {
+        assert(primaryDeviceLoginCalls == primaryBeforeBack);
+        assert(![defaults boolForKey:RUINSecondaryLoginEnabledKey]);
+        DrainMainQueue();
+        assert([lastPresentedAlertTitle isEqual:@"ログイン方法を切り替えました"]);
+        secondary.presentedViewController = nil;
+    } else {
+        assert(primaryDeviceLoginCalls == primaryBeforeBack + 1);
+    }
     puts("PASS secondary login: late Welcome/secondary hooks, native AX hits without child graph, multi-window gestures, preflight, persisted preference, no native-role writes");
 } return 0; }

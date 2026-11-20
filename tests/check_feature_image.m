@@ -259,8 +259,31 @@ static void CheckRuntimeBoundaries(const RUINHostIdentity *host,
     runtimePinAvailable = YES;
     assert(RuntimeResolveFeature(host, FeatureImageOwner.class, &image));
     assert(image.convertedExecutable && image.loaderReference == &runtimeLoaderToken);
+    assert([RuntimeResolutionStatus() isEqualToString:@"resolved"]);
     RuntimeReleaseFeature(&image);
     assert(runtimeCloseCalls == 1);
+    // A repeated resolution reuses the discovery result: one NOLOAD reference,
+    // one live snapshot revalidation, the caller still owns the pin.
+    assert(RuntimeResolveFeature(host, FeatureImageOwner.class, &image));
+    assert([RuntimeResolutionStatus() isEqualToString:@"resolvedCached"]);
+    assert(image.convertedExecutable && image.loaderReference == &runtimeLoaderToken);
+    assert(image.image.header == &guest.header && runtimeOpenCalls == 3);
+    RuntimeReleaseFeature(&image);
+    assert(runtimeCloseCalls == 2);
+    // A stale cached slide is a miss, never a hit; full resolution rejects it
+    // with the same single reference.
+    runtimeCandidates[0].slide++; runtimeCandidates[1].slide++;
+    assert(!RuntimeResolveFeature(host, FeatureImageOwner.class, &image));
+    assert(runtimeOpenCalls == 4 && runtimeCloseCalls == 3 && !image.image.header);
+    runtimeCandidates[0].slide--; runtimeCandidates[1].slide--;
+    // Without a pin the cached converted image is rejected without a second
+    // dlopen or a rescan.
+    runtimePinAvailable = NO;
+    unsigned snapshots = runtimeSnapshotCalls;
+    assert(!RuntimeResolveFeature(host, FeatureImageOwner.class, &image));
+    assert(runtimeOpenCalls == 5 && runtimeCloseCalls == 3 && !image.image.header);
+    assert([RuntimeResolutionStatus() isEqualToString:@"imageLifetimeUnproven"]);
+    assert(runtimeSnapshotCalls - snapshots == 2); // One guarded snapshot (count is read twice).
 
     // A virtualized process path and MH_EXECUTE rewrite still cannot turn a
     // converted guest into the no-pin native case, even if kernel input lies.

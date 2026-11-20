@@ -191,7 +191,7 @@ def main():
     status = source[source.index("typedef enum {"):source.index("typedef struct {")]
     state = source[source.index("static Class gTalkTopBannerClass"):source.index("static atomic_int gStartupStatus")]
     hooks = source[source.index("// SmartChannel shares a slot"):source.index("static BOOL RUINPrepareMethodHook(")]
-    install = source[source.index("static BOOL RUINIsUIViewSubclass("):source.index("static void RUINMarkHooksVersionGated(")]
+    install = source[source.index("static BOOL RUINIsUIViewSubclass(Class cls)\n"):source.index("static void RUINMarkHooksVersionGated(")]
     with tempfile.TemporaryDirectory(prefix="ruin-talk-ads-") as temporary:
         directory = Path(temporary)
         logos = directory / "check.x"

@@ -6,6 +6,7 @@
 #import "Sideload.h"
 #import "AppGroupStorage.h"
 #import "../core/TargetMetadata.h"
+#import "../core/StartupProfiler.h"
 #include <stdatomic.h>
 
 static NSDictionary<NSString *, NSString *> *groupMap;
@@ -97,26 +98,33 @@ static NSArray *RUINProfileGroups(void) {
 }
 
 static void RUINPrepareStorageBindings(NSDictionary *requestedMap) {
+    RUIN_PROFILE_BEGIN("sideload.prepare_storage");
     NSFileManager *manager = NSFileManager.defaultManager;
     NSURL *support = [manager URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject;
-    if (!support) { unsafeStorageCount++; return; }
+    if (!support) { unsafeStorageCount++; RUIN_PROFILE_END(RUINProfileStatusFailed); return; }
     NSMutableSet *identifiers = [NSMutableSet setWithArray:RUINOriginalGroups()];
-    [identifiers addObjectsFromArray:RUINProfileGroups()];
+    RUIN_PROFILE_BEGIN("sideload.parse_provision");
+    NSArray *profileGroups = RUINProfileGroups();
+    RUIN_PROFILE_END(RUINProfileStatusOK);
+    [identifiers addObjectsFromArray:profileGroups];
     [identifiers addObjectsFromArray:requestedMap.allValues];
     NSMutableDictionary<NSString *,NSURL *> *authorized = [NSMutableDictionary dictionary];
     // Runs before installing the FileManager hook, so these are OS-authorized
     // URLs rather than aliases projected by RUIN.
+    RUIN_PROFILE_BEGIN("sideload.resolve_containers");
     for (id identifier in identifiers) {
         if (![identifier isKindOfClass:NSString.class] || ![identifier hasPrefix:@"group."] ||
             [identifier containsString:@"/"] || [identifier containsString:@".."] || [identifier length] > 255) continue;
         NSURL *url = [manager containerURLForSecurityApplicationGroupIdentifier:identifier];
         if (url.isFileURL) authorized[identifier] = url;
     }
+    RUIN_PROFILE_END(RUINProfileStatusOK);
     id value = [NSUserDefaults.standardUserDefaults objectForKey:@"mid"];
     NSString *account = [value isKindOfClass:NSString.class] ? value : @"";
     NSString *signingIdentifier = RUINSandboxSigningIdentifier();
     NSMutableDictionary *URLs = [NSMutableDictionary dictionary], *suites = [NSMutableDictionary dictionary];
     NSMutableArray *errors = [NSMutableArray array];
+    RUIN_PROFILE_BEGIN("sideload.resolve_groups");
     for (NSString *logical in RUINOriginalGroups()) {
         NSURL *fallback = [[support URLByAppendingPathComponent:@"RUIN/AppGroups" isDirectory:YES]
             URLByAppendingPathComponent:logical isDirectory:YES];
@@ -162,9 +170,11 @@ static void RUINPrepareStorageBindings(NSDictionary *requestedMap) {
                 @"errorCode":@(error.code), @"stage":@"recordExplicitMap"}];
         }
     }
+    RUIN_PROFILE_END(RUINProfileStatusOK);
     storageBindingErrors = [errors copy];
     resolvedGroupURLs = [URLs copy];
     groupMap = [suites copy];
+    RUIN_PROFILE_END(RUINProfileStatusOK);
 }
 
 %group RUINAppGroupMapping

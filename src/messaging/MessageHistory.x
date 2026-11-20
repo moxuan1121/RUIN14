@@ -5,6 +5,7 @@
 #import "MessageHistory.h"
 #import "Features.h"
 #import "../core/Localization.h"
+#import "../core/StartupProfiler.h"
 #import "NativeReadPositions.h"
 #import <CoreData/CoreData.h>
 #import <CommonCrypto/CommonDigest.h>
@@ -934,19 +935,25 @@ void RUINInstallMessageHistory(void) {
     if (!supported) return;
     @synchronized (RUINHistoryStore.class) {
         if (!historyQueue) {
+            RUIN_PROFILE_BEGIN("message_history.create_queue");
             historyQueue = dispatch_queue_create("ruin.message-history", DISPATCH_QUEUE_SERIAL);
             dispatch_queue_set_specific(historyQueue, &historyQueueKey, &historyQueueKey, NULL);
             historyHooks = [NSMutableDictionary dictionary];
+            RUIN_PROFILE_END(RUINProfileStatusOK);
         }
         if (!historyStore) {
             NSURL *root = [NSFileManager.defaultManager URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject;
+            RUIN_PROFILE_BEGIN("message_history.store_open");
             historyStore = [[RUINHistoryStore alloc] initWithURL:[root URLByAppendingPathComponent:@"RUIN/history.sqlite"] error:NULL];
+            RUIN_PROFILE_END(historyStore ? RUINProfileStatusOK : RUINProfileStatusFailed);
         }
         if (!historyStore) return;
+        RUIN_PROFILE_BEGIN("message_history.install_hooks");
         InstallHistoryHook("ManagedMessage", "didSave", "v16@0:8", InitRUINHistoryTalk);
         InstallHistoryHook("ManagedSquareMessage", "didSave", "v16@0:8", InitRUINHistorySquare);
         InstallHistoryHook("LineTMessageReadRange", "read:", "v24@0:8@16", InitRUINHistoryRead);
         InstallHistoryHook("LineTMessageReadRange", "ranges", "@16@0:8", InitRUINHistoryRanges);
+        RUIN_PROFILE_END(RUINProfileStatusOK);
     }
 }
 NSArray<NSDictionary *> *RUINReadUsersForMessage(id message) {

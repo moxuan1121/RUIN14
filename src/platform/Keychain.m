@@ -9,6 +9,7 @@
 #import "Keychain.h"
 #import "../core/TargetMetadata.h"
 #import "../core/NativeFunctionPointer.h"
+#import "../core/StartupProfiler.h"
 
 #if !defined(RUIN_KEYCHAIN_HOST_CHECK)
 #import "fishhook.h"
@@ -427,45 +428,54 @@ void RUINInstallKeychainCompatibility(void) {
     // Protected keychain data or bundle identity may be unavailable during
     // early launch. A failed probe must not disable login for this process.
     @synchronized (NSProcessInfo.processInfo) {
-        if (compatibilityReady) return;
+        if (compatibilityReady) { RUIN_PROFILE_INSTANT("keychain.already_ready", RUINProfileStatusSkipped); return; }
         RUINInstallBundleIdentity();
         NSDictionary *logicalInfo = NSBundle.mainBundle.infoDictionary;
         NSString *status = RUINBundleIdentityDiagnostics()[@"status"];
-        if (!RUINKeychainTargetEligible(status, logicalInfo)) return;
+        if (!RUINKeychainTargetEligible(status, logicalInfo)) { RUIN_PROFILE_INSTANT("keychain.ineligible", RUINProfileStatusSkipped); return; }
 
         NSDictionary *metadata = RUINActualMainBundleInfo();
+        RUIN_PROFILE_BEGIN("keychain.default_group_probe");
         NSString *defaultGroup = RUINDefaultAccessGroupWithOperations(SecItemAdd, SecItemDelete);
+        RUIN_PROFILE_END(defaultGroup ? RUINProfileStatusOK : RUINProfileStatusFailed);
         if (!defaultGroup) { keychainBindingStatus = @"DefaultAccessGroupUnavailable"; return; }
         BOOL originalGroupsAllowed = NO;
+        RUIN_PROFILE_BEGIN("keychain.build_access_group_map");
         NSDictionary *mapping = RUINBuildAccessGroupMap(defaultGroup, metadata,
             ^RUINGroupPermission(NSString *group) { return RUINProbeAccessGroupPermission(group); },
             &originalGroupsAllowed);
+        RUIN_PROFILE_END(mapping ? RUINProfileStatusOK : RUINProfileStatusFailed);
         if (!mapping) { keychainBindingStatus = @"PermissionUnproven"; return; }
         accessGroupMap = mapping;
 
         RUINMainExecutableImage mainImage = {0};
         const RUINVersionMapping *currentMapping = NULL;
         BOOL verifiedPlainMainImage = NO;
+        RUIN_PROFILE_BEGIN("keychain.verify_main_image");
         if (mapping.count) {
             currentMapping = RUINCurrentMapping();
             verifiedPlainMainImage = currentMapping && RUINResolveMainExecutableImage(&mainImage) &&
                 RUINKeychainMainImageAllowsRebinding(currentMapping, &mainImage, RUINUsesAuthenticatedImports());
         }
+        RUIN_PROFILE_END(mapping.count ? (verifiedPlainMainImage ? RUINProfileStatusOK : RUINProfileStatusFailed) : RUINProfileStatusSkipped);
         RUINKeychainBindingAction action = RUINKeychainBindingActionForMap(
             mapping, originalGroupsAllowed, verifiedPlainMainImage);
         if (RUINKeychainBindingActionCanReadyWithoutRebind(action)) {
             keychainBindingStatus = @"NativePassthrough";
             compatibilityReady = YES;
+            RUIN_PROFILE_INSTANT("keychain.binding.native_passthrough", RUINProfileStatusOK);
             return;
         }
         if (action == RUINKeychainBindingActionUnsupportedAuthenticatedImports) {
             // This fork's fishhook does not authenticate or re-sign auth-GOT slots.
             compatibilityReady = NO;
             keychainBindingStatus = @"UnsupportedAuthenticatedImports";
+            RUIN_PROFILE_INSTANT("keychain.binding.unsupported_authenticated_imports", RUINProfileStatusSkipped);
             return;
         }
         if (!RUINKeychainBindingActionNeedsRebind(action)) {
             keychainBindingStatus = @"PermissionUnproven";
+            RUIN_PROFILE_INSTANT("keychain.binding.permission_unproven", RUINProfileStatusSkipped);
             return;
         }
 
@@ -473,11 +483,13 @@ void RUINInstallKeychainCompatibility(void) {
         // group. Pin that proven mapping too, rather than requiring a specific
         // shared-group suffix which grants no additional access or stability.
         if (mapping.count) {
+            RUIN_PROFILE_BEGIN("keychain.namespace_binding");
             NSString *bindingGroup = mapping[RUINOldSharedAccessGroup] ?: RUINOldSharedAccessGroup;
             OSStatus bindingStatus = errSecNotAvailable;
             NSDictionary *saved = RUINLoadNamespaceBinding(bindingGroup,&bindingStatus);
             if (bindingStatus != errSecSuccess && bindingStatus != errSecItemNotFound) {
                 keychainBindingStatus = @"NamespaceBindingUnavailable";
+                RUIN_PROFILE_END(RUINProfileStatusFailed);
                 return;
             }
             mapping = RUINApplyAccessGroupBinding(mapping,saved,defaultGroup,
@@ -486,10 +498,14 @@ void RUINInstallKeychainCompatibility(void) {
                     namespaceBindingPersisted = saved != nil || RUINSaveNamespaceBinding(bindingGroup,reconciled);
                     return namespaceBindingPersisted;
                 });
-            if (!mapping) { keychainBindingStatus = @"NamespaceBindingUnavailable"; return; }
+            if (!mapping) { keychainBindingStatus = @"NamespaceBindingUnavailable"; RUIN_PROFILE_END(RUINProfileStatusFailed); return; }
+            RUIN_PROFILE_END(RUINProfileStatusOK);
         }
 
-        if (!RUINResolveSecurityItemOperations()) {
+        RUIN_PROFILE_BEGIN("keychain.resolve_operations");
+        BOOL operationsResolved = RUINResolveSecurityItemOperations();
+        RUIN_PROFILE_END(operationsResolved ? RUINProfileStatusOK : RUINProfileStatusFailed);
+        if (!operationsResolved) {
             compatibilityReady = NO;
             keychainBindingStatus = @"RebindUnavailable";
             return;
@@ -500,8 +516,10 @@ void RUINInstallKeychainCompatibility(void) {
             {"SecItemUpdate", (void *)RUINNativeFunctionPointerRaw((const void *)RUINSecItemUpdate), NULL},
             {"SecItemDelete", (void *)RUINNativeFunctionPointerRaw((const void *)RUINSecItemDelete), NULL}
         };
+        RUIN_PROFILE_BEGIN("keychain.rebind_symbols");
         int result = rebind_symbols_image((void *)mainImage.header, mainImage.slide,
             rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
+        RUIN_PROFILE_END(result == 0 ? RUINProfileStatusOK : RUINProfileStatusFailed);
         compatibilityReady = namespaceBindingPersisted && result == 0 && originalSecItemCopyMatching && originalSecItemAdd &&
             originalSecItemUpdate && originalSecItemDelete;
         keychainBindingStatus = compatibilityReady ? @"RebindReady" : @"RebindUnavailable";

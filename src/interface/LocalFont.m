@@ -1,4 +1,5 @@
 #import "LocalFont.h"
+#import "../core/StartupProfiler.h"
 #import <CoreText/CoreText.h>
 #import <math.h>
 #import <stdatomic.h>
@@ -136,17 +137,30 @@ void RUINInstallLocalFont(void) {
     dispatch_once(&sInstallOnce, ^{
         @synchronized (RUINLocalFontLock()) {
             sRegisteredURLs = [NSMutableDictionary dictionary];
+            RUIN_PROFILE_BEGIN("localfont.read_selection");
             NSDictionary *selection = [NSUserDefaults.standardUserDefaults
                 dictionaryForKey:RUINLocalFontDefaultsKey];
             NSURL *directory = RUINLocalFontDirectory(NO, nil);
             NSURL *url = directory ? RUINStoredLocalFontURL(selection, directory) : nil;
+            RUIN_PROFILE_END(url ? RUINProfileStatusOK : RUINProfileStatusSkipped);
             NSString *storedName = selection[@"name"];
             NSString *validatedName = nil;
             unsigned long long bytes = 0;
             NSError *error = nil;
-            if (url && [storedName isKindOfClass:NSString.class] &&
-                RUINValidateLocalFont(url, &validatedName, &bytes, &error) &&
-                [validatedName isEqualToString:storedName] && RUINRegisterLocalFont(url, &error)) {
+            BOOL valid = NO;
+            BOOL registered = NO;
+            if (url && [storedName isKindOfClass:NSString.class]) {
+                RUIN_PROFILE_BEGIN("localfont.validate");
+                valid = RUINValidateLocalFont(url, &validatedName, &bytes, &error) &&
+                    [validatedName isEqualToString:storedName];
+                RUIN_PROFILE_END(valid ? RUINProfileStatusOK : RUINProfileStatusFailed);
+                if (valid) {
+                    RUIN_PROFILE_BEGIN("localfont.register");
+                    registered = RUINRegisterLocalFont(url, &error);
+                    RUIN_PROFILE_END(registered ? RUINProfileStatusOK : RUINProfileStatusFailed);
+                }
+            }
+            if (valid && registered) {
                 sName = validatedName;
                 sURL = url;
                 sFileSize = bytes;
@@ -154,10 +168,10 @@ void RUINInstallLocalFont(void) {
                 atomic_store_explicit(&sFontActive, true, memory_order_release);
                 sRegisteredURLs[validatedName] = url;
                 sStatus = @"loaded";
-                RUINRemoveManagedFontsExcept(directory, url);
+                RUIN_PROFILE_CALL("localfont.cleanup", RUINRemoveManagedFontsExcept(directory, url));
             } else {
                 sStatus = selection ? @"restore_failed" : @"default";
-                if (directory) RUINRemoveManagedFontsExcept(directory, nil);
+                if (directory) RUIN_PROFILE_CALL("localfont.cleanup", RUINRemoveManagedFontsExcept(directory, nil));
             }
         }
     });

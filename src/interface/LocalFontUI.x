@@ -75,6 +75,7 @@ void RUINOpenLocalFontSettings(UIViewController *presenter) {
 #import <mach-o/dyld.h>
 #import <stdatomic.h>
 #import <objc/runtime.h>
+#import "../core/StartupProfiler.h"
 
 static atomic_uint_fast64_t sFontReplacements, sFontFactoryCalls, sFontInactiveCalls;
 static _Thread_local BOOL sReplacingFont;
@@ -85,14 +86,19 @@ static _Atomic(const char *) sFontImageStatus = "notAttempted";
 static void RUINRefreshFontCallerImage(void) {
     @synchronized (UIFont.class) {
         if (atomic_load_explicit(&sFontCallerHeader, memory_order_acquire)) return;
+        RUIN_PROFILE_BEGIN("localfont_hooks.mapping_lookup");
         const RUINVersionMapping *version = RUINMappingForInfo(NSBundle.mainBundle.infoDictionary);
+        RUIN_PROFILE_END(version ? RUINProfileStatusOK : RUINProfileStatusSkipped);
         RUINMainExecutableImage native = {0};
         RUINHostIdentity nativeHost = {0};
         NSString *nativeUUID = nil;
         if (!version) {
             // Keep version-independent native UI support. Metadata alone never
             // admits an unknown LC guest: this fallback must remain process-main.
-            if (!RUINResolveMainExecutableImage(&native)) {
+            RUIN_PROFILE_BEGIN("localfont_hooks.resolve_main_image");
+            BOOL mainResolved = RUINResolveMainExecutableImage(&native);
+            RUIN_PROFILE_END(mainResolved ? RUINProfileStatusOK : RUINProfileStatusFailed);
+            if (!mainResolved) {
                 atomic_store(&sFontImageStatus, "mappingUnavailable"); return;
             }
             nativeUUID = [[NSUUID alloc] initWithUUIDBytes:native.uuid].UUIDString;
@@ -101,8 +107,11 @@ static void RUINRefreshFontCallerImage(void) {
         RUINFeatureImage image = {0};
         // Prove the original class owner, including LC's MH_EXECUTE rewrite.
         // A successful proof owns its loader reference for the hooks' lifetime.
-        if (!RUINResolveFeatureImage(version ? &version->host : &nativeHost,
-            objc_getClass("_TtC4LINE11AppDelegate"), &image)) {
+        RUIN_PROFILE_BEGIN("localfont_hooks.resolve_image");
+        BOOL imageResolved = RUINResolveFeatureImage(version ? &version->host : &nativeHost,
+            objc_getClass("_TtC4LINE11AppDelegate"), &image);
+        RUIN_PROFILE_END(imageResolved ? RUINProfileStatusOK : RUINProfileStatusFailed);
+        if (!imageResolved) {
             atomic_store(&sFontImageStatus, "ownerImageUnavailable");
             return;
         }
@@ -174,9 +183,13 @@ static BOOL RUINIsSystemTextFont(UIFont *font) {
 
 void RUINInstallLocalFontHooks(void) {
     // One proof attempt per explicit install/activation, never per font call.
+    RUIN_PROFILE_BEGIN("localfont_hooks.refresh_image");
     RUINRefreshFontCallerImage();
+    RUIN_PROFILE_END(RUINProfileStatusOK);
     static dispatch_once_t once;
+    RUIN_PROFILE_BEGIN("localfont_hooks.init_hooks");
     dispatch_once(&once, ^{ %init(RUINLocalTextFont); });
+    RUIN_PROFILE_END(RUINProfileStatusOK);
 }
 
 NSDictionary *RUINLocalFontHookDiagnostics(void) {

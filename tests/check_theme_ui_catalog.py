@@ -79,8 +79,10 @@ int main(int argc, const char **argv) { @autoreleasepool {
 
 def main():
     source = (THEMES / "ThemeUI.m").read_text()
+    settings_start = source.index("@implementation RUINThemeSettingsViewController")
+    settings = source[settings_start:source.index("\n@end", settings_start)]
     helpers = extract(source, "typedef NS_ENUM(NSInteger, RUINThemeUISection)", "static NSString *RUINThemeUINativeStatus(")
-    methods = extract(source, "- (NSInteger)numberOfSectionsInTableView:", "- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:")
+    methods = extract(settings, "- (NSInteger)numberOfSectionsInTableView:", "- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:")
     shim = '''#import <Foundation/Foundation.h>
 #import "ThemeProductIdentity.h"
 #import "ThemeVersion.h"

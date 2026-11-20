@@ -4,6 +4,7 @@
 #import "MessagingPrivateAPI.h"
 #import "MenuExtras.h"
 #import "../core/Localization.h"
+#import "../core/StartupProfiler.h"
 
 #import "Features.h"
 #import "ReadersSheet.h"
@@ -1539,7 +1540,10 @@ void RUINInstallMenuExtras(void)
 {
     atomic_store_explicit(&sInstallAttempted, true, memory_order_release);
     os_unfair_lock_lock(&sMenuHookLock);
-    if (!RUINMenuExtrasTargetMatches()) {
+    RUIN_PROFILE_BEGIN("menu.target_match");
+    BOOL menuTargetMatches = RUINMenuExtrasTargetMatches();
+    RUIN_PROFILE_END(menuTargetMatches ? RUINProfileStatusOK : RUINProfileStatusFailed);
+    if (!menuTargetMatches) {
         atomic_store_explicit(&sMenuHookStatus, RUINMenuExtrasHookVersionGated, memory_order_release);
         atomic_store_explicit(&sCalloutSurfaceHookStatus, RUINMenuExtrasHookVersionGated, memory_order_release);
         atomic_store_explicit(&sCalloutGridHookStatus, RUINMenuExtrasHookVersionGated, memory_order_release);
@@ -1549,7 +1553,7 @@ void RUINInstallMenuExtras(void)
         return;
     }
 
-    RUINMenuExtrasPrepareReadUntilAvailability();
+    RUIN_PROFILE_CALL("menu.prepare_read_until", RUINMenuExtrasPrepareReadUntilAvailability());
 
     if (!sRetainedMediaObserverToken) {
         sRetainedMediaObserverToken = [NSNotificationCenter.defaultCenter
@@ -1560,8 +1564,10 @@ void RUINInstallMenuExtras(void)
     }
 
     Class interaction = objc_getClass("_TtC17LineMessagingUIV229MessageContextMenuInteraction");
+    RUIN_PROFILE_BEGIN("menu.validate_long_press");
     RUINMenuExtrasHookStatus menuStatus = sMenuLongPressInstalled ? RUINMenuExtrasHookInstalled :
         RUINMenuExtrasValidateHook(interaction, sel_registerName("handleLongPressGesture:"), "v24@0:8@16", YES);
+    RUIN_PROFILE_END(menuStatus == RUINMenuExtrasHookInstalled ? RUINProfileStatusOK : RUINProfileStatusFailed);
     if (!sMenuLongPressInstalled && menuStatus == RUINMenuExtrasHookInstalled) {
         %init(RUINMenuLongPress, RUINMenuInteraction = interaction);
         sMenuLongPressInstalled = YES;
@@ -1569,8 +1575,10 @@ void RUINInstallMenuExtras(void)
     atomic_store(&sMenuHookStatus, menuStatus);
 
     Class container = objc_getClass("_TtC22LineSharedUIComponents24CalloutMenuContainerView");
+    RUIN_PROFILE_BEGIN("menu.validate_callout_window");
     RUINMenuExtrasHookStatus windowStatus = sCalloutWindowInstalled ? RUINMenuExtrasHookInstalled :
         RUINMenuExtrasValidateHook(container, sel_registerName("didMoveToWindow"), "v16@0:8", NO);
+    RUIN_PROFILE_END(windowStatus == RUINMenuExtrasHookInstalled ? RUINProfileStatusOK : RUINProfileStatusFailed);
     if (!sCalloutWindowInstalled && windowStatus == RUINMenuExtrasHookInstalled) {
         %init(RUINMenuWindow, RUINMenuContainer = container);
         sCalloutWindowInstalled = YES;
@@ -1578,20 +1586,26 @@ void RUINInstallMenuExtras(void)
     atomic_store(&sCalloutSurfaceHookStatus, windowStatus);
 
     Class callout = objc_getClass("_TtC22LineSharedUIComponents15CalloutMenuView");
+    RUIN_PROFILE_BEGIN("menu.validate_callout_count");
     RUINMenuExtrasHookStatus numberStatus = sCalloutCountInstalled ? RUINMenuExtrasHookInstalled :
         RUINMenuExtrasValidateHook(callout, sel_registerName("collectionView:numberOfItemsInSection:"), "q32@0:8@16q24", YES);
+    RUIN_PROFILE_END(numberStatus == RUINMenuExtrasHookInstalled ? RUINProfileStatusOK : RUINProfileStatusFailed);
     if (!sCalloutCountInstalled && numberStatus == RUINMenuExtrasHookInstalled) {
         %init(RUINMenuCount, RUINMenuCallout = callout);
         sCalloutCountInstalled = YES;
     }
+    RUIN_PROFILE_BEGIN("menu.validate_callout_cell");
     RUINMenuExtrasHookStatus cellStatus = sCalloutCellInstalled ? RUINMenuExtrasHookInstalled :
         RUINMenuExtrasValidateHook(callout, sel_registerName("collectionView:cellForItemAtIndexPath:"), "@32@0:8@16@24", YES);
+    RUIN_PROFILE_END(cellStatus == RUINMenuExtrasHookInstalled ? RUINProfileStatusOK : RUINProfileStatusFailed);
     if (!sCalloutCellInstalled && cellStatus == RUINMenuExtrasHookInstalled) {
         %init(RUINMenuCell, RUINMenuCallout = callout);
         sCalloutCellInstalled = YES;
     }
+    RUIN_PROFILE_BEGIN("menu.validate_callout_selection");
     RUINMenuExtrasHookStatus selectStatus = sCalloutSelectionInstalled ? RUINMenuExtrasHookInstalled :
         RUINMenuExtrasValidateHook(callout, sel_registerName("collectionView:didSelectItemAtIndexPath:"), "v32@0:8@16@24", YES);
+    RUIN_PROFILE_END(selectStatus == RUINMenuExtrasHookInstalled ? RUINProfileStatusOK : RUINProfileStatusFailed);
     if (!sCalloutSelectionInstalled && selectStatus == RUINMenuExtrasHookInstalled) {
         %init(RUINMenuSelection, RUINMenuCallout = callout);
         sCalloutSelectionInstalled = YES;
@@ -1606,8 +1620,10 @@ void RUINInstallMenuExtras(void)
     }
     atomic_store(&sCalloutGridHookStatus, gridStatus);
 
+    RUIN_PROFILE_BEGIN("menu.validate_callout_intrinsic");
     RUINMenuExtrasHookStatus intrinsicStatus = sCalloutIntrinsicInstalled ? RUINMenuExtrasHookInstalled :
         RUINMenuExtrasValidateHook(callout, sel_registerName("intrinsicContentSize"), "{CGSize=dd}16@0:8", YES);
+    RUIN_PROFILE_END(intrinsicStatus == RUINMenuExtrasHookInstalled ? RUINProfileStatusOK : RUINProfileStatusFailed);
     if (!sCalloutIntrinsicInstalled && intrinsicStatus == RUINMenuExtrasHookInstalled) {
         %init(RUINMenuIntrinsic, RUINMenuCallout = callout);
         sCalloutIntrinsicInstalled = YES;
