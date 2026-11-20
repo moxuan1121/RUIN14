@@ -127,7 +127,6 @@ private func ruinMirrorDisplayKind(_ mirror: Mirror) -> String {
     switch mirror.displayStyle {
     case .class: return "class"
     case .struct: return "struct"
-    case .foreignReference: return "class"
     case .enum: return "enum"
     case .collection: return "collection"
     case .dictionary: return "dictionary"
