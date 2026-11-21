@@ -297,6 +297,7 @@ static NSUInteger BadgeCorrection(NSManagedObjectContext *context, NSPersistentS
 @property(nonatomic) NSInteger targetCount;
 @property(nonatomic, copy) NSString *targetTitle;
 @property(nonatomic) NSUInteger generation;
+@property(nonatomic, weak) NSManagedObject *checkedChat; // LINE 14.6.3: chat last evaluated by Apply
 @end
 @implementation RUINBadgeDisplay @end
 
@@ -362,6 +363,7 @@ static void UnbindButtonRecord(UIButton *button, RUINBadgeDisplay *record) {
 }
 
 static NSDictionary *lastButtonState;
+static NSUInteger relayoutApplies;
 static void NoteButtonState(UIButton *button, NSInteger target) {
     if (!button) return;
     lastButtonState = @{@"class":NSStringFromClass(button.class), @"superview":NSStringFromClass(button.superview.class ?: NSNull.class),
@@ -486,6 +488,7 @@ static void Apply(RUINBadgeCell *cell) {
     if (!Enabled() || !cell.window) return;
     NSManagedObject *chat = RUINCopySwiftField(cell, "chatObject");
     UIButton *button = RUINCopySwiftField(cell, "unreadCountButton");
+    Display(cell).checkedChat = chat;
     if (![chat isKindOfClass:NSManagedObject.class] || ![button isKindOfClass:UIButton.class] ||
         ![button isDescendantOfView:cell]) return;
     NSString *account = RUINChatCatalogAccount();
@@ -634,8 +637,21 @@ static RUINBadgeDisplay *ActiveRecordForButton(id button) {
     return result;
 }
 - (void)didMoveToWindow { Restore((id)self); %orig; Apply((id)self); }
-- (void)layoutSubviews { %orig; EnforceDisplay((id)self); }
-- (void)prepareForReuse { Restore((id)self); %orig; }
+- (void)layoutSubviews {
+    %orig;
+    RUINBadgeDisplay *record = objc_getAssociatedObject(self, &DisplayKey);
+    // LINE 14.6.3 reconfigures reused cells without render/didMoveToWindow:
+    // evaluate again once the cell is bound to a different (or no checked) chat.
+    if (record.overridden) EnforceDisplay((id)self);
+    else if (Enabled() && ((UIView *)self).window && RUINCopySwiftField(self, "chatObject") != record.checkedChat) { relayoutApplies++; Apply((id)self); }
+}
+- (void)prepareForReuse { Restore((id)self); Display((id)self).checkedChat = nil; %orig; }
+%end
+%end
+
+%group RUINLocalBadgeCellAttributes
+%hook RUINBadgeCell
+- (void)updateAttributes { Restore((id)self); %orig; Apply((id)self); }
 %end
 %end
 
@@ -719,6 +735,8 @@ void RUINInstallLocalUnreadBadges(void) {
             !MethodMatches(chat, @selector(viewDidAppear:), "v20@0:8B16") ||
             !MethodMatches(chat, @selector(viewWillDisappear:), "v20@0:8B16")) { rejected++; return; }
         %init(RUINLocalBadgeCells, RUINBadgeCell=cell);
+        Method attributes = class_getInstanceMethod(cell, @selector(updateAttributes));
+        if (attributes && !strcmp(method_getTypeEncoding(attributes), "v16@0:8")) { %init(RUINLocalBadgeCellAttributes, RUINBadgeCell=cell); }
         %init(RUINLocalBadgeVisits, RUINBadgeChatController=chat);
         installed = YES;
         // UIKit can restore the Talk tab before didBecomeActive installs the
@@ -745,7 +763,7 @@ NSDictionary *RUINLocalUnreadBadgesDiagnostics(void) {
         @"trackedCells":@(cells.count),
         @"countPolicy":BadgeCountDiagnostics(),
         @"tab":RUINLocalUnreadTabBadgeDiagnostics(),
-        @"lastButton":lastButtonState ?: @{},
+        @"lastButton":lastButtonState ?: @{}, @"relayoutApplies":@(relayoutApplies),
         @"scope":@"chat_list_and_talk_tab_display_only", @"nativeDataWritten":@NO, @"readReceiptsSent":@NO};
 }
 #endif

@@ -14,7 +14,7 @@
 @implementation RUINLocalTabBadgeState @end
 
 static char StateKey, BoundItemKey;
-static Class rootClass, chatClass;
+static Class rootClass, chatClass, chatAltClass;
 static NSHashTable<UITabBarController *> *roots;
 static NSUInteger correction, correctionWrites, rawChanges, bindings;
 static BOOL installed;
@@ -46,7 +46,7 @@ static UITabBarItem *TalkItem(UITabBarController *root) {
         NSUInteger depth = 0;
         while ([content isKindOfClass:UINavigationController.class] && depth++ < 8)
             content = ((UINavigationController *)content).viewControllers.firstObject;
-        if (!chatClass || ![content isKindOfClass:chatClass]) continue;
+        if (!chatClass || (![content isKindOfClass:chatClass] && !(chatAltClass && [content isKindOfClass:chatAltClass]))) continue;
         UITabBarItem *item = entry.tabBarItem;
         if (!item || (found && found != item)) return nil; // Ambiguous native structure: preserve it.
         found = item;
@@ -174,6 +174,7 @@ void RUINInstallLocalUnreadTabBadge(void) {
         if (!method || strcmp(method_getTypeEncoding(method), types[i]) || !method_getImplementation(method)) return;
     }
     rootClass = root; chatClass = chat;
+    chatAltClass = NSClassFromString(@"_TtC13LineChatTabUI21ChatTabViewController"); // LINE 14.6.3 Talk tab root
     roots = [NSHashTable weakObjectsHashTable];
     %init(RUINLocalUnreadTabBadgeHooks, RUINUnreadNativeRoot = root);
     if (hasTabs) { %init(RUINLocalUnreadTabBadgeTabs, RUINUnreadNativeTabsRoot = root); }
@@ -192,9 +193,21 @@ void RUINSetLocalUnreadTabBadgeCorrection(NSUInteger count) {
     for (UITabBarController *root in roots.allObjects) RefreshRoot(root);
 }
 
+static NSArray *TabShapes(void) {
+    NSMutableArray *out = [NSMutableArray array];
+    UITabBarController *root = roots.allObjects.firstObject;
+    for (UIViewController *entry in root.viewControllers) {
+        UIViewController *content = entry;
+        NSUInteger depth = 0;
+        while ([content isKindOfClass:UINavigationController.class] && depth++ < 8)
+            content = ((UINavigationController *)content).viewControllers.firstObject;
+        [out addObject:@{@"content":content ? NSStringFromClass(content.class) : @"", @"badge":entry.tabBarItem.badgeValue ?: @""}];
+    }
+    return out;
+}
 NSDictionary *RUINLocalUnreadTabBadgeDiagnostics(void) {
     return @{@"installed":@(installed), @"correction":@(correction), @"bindings":@(bindings),
         @"rawChanges":@(rawChanges), @"displayWrites":@(correctionWrites),
         @"rootClass":rootClass ? NSStringFromClass(rootClass) : @"", @"chatClass":chatClass ? NSStringFromClass(chatClass) : @"",
-        @"liveRoots":@(roots.allObjects.count)};
+        @"liveRoots":@(roots.allObjects.count), @"tabs":TabShapes()};
 }
