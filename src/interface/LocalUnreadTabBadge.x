@@ -5,6 +5,7 @@
 #import "TargetMetadata.h"
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #include <string.h>
 
 @interface RUINLocalTabBadgeState : NSObject
@@ -54,6 +55,32 @@ static UITabBarItem *TalkItem(UITabBarController *root) {
     return found;
 }
 
+// ---- LINE 14.6.3: the Talk badge is drawn by LINE.SkinnedTabBarItem and set
+// through the category setter -[UITabBarItem setSkinnedBadgeValue:]; the
+// system badgeValue stays nil. The last native value is recorded from launch.
+static char SkinnedNativeKey;
+static BOOL skinnedHooked;
+static NSUInteger skinnedNativeSets, skinnedWrites;
+static NSString *skinnedValueClass;
+static id ProjectedSkinned(id native, NSUInteger count) {
+    if ([native isKindOfClass:NSNumber.class]) {
+        long long value = [native longLongValue];
+        if (!count || value <= 0) return native;
+        return value > (long long)count ? @(value - (long long)count) : @0;
+    }
+    if (native == nil || [native isKindOfClass:NSString.class]) return ProjectedValue(native, count);
+    return native;
+}
+static void WriteSkinned(UITabBarItem *item, NSUInteger count) {
+    if (!skinnedHooked || !item) return;
+    id stored = objc_getAssociatedObject(item, &SkinnedNativeKey);
+    if (!stored) return; // Native value not observed yet: never invent one.
+    id native = stored == NSNull.null ? nil : stored;
+    UITabBarItem *previous = applyingItem;
+    applyingItem = item;
+    @try { ((void (*)(id, SEL, id))objc_msgSend)(item, @selector(setSkinnedBadgeValue:), ProjectedSkinned(native, count)); skinnedWrites++; }
+    @finally { applyingItem = previous; }
+}
 static void WriteValue(UITabBarItem *item, NSString *value) {
     if (SameValue(item.badgeValue, value)) return;
     UITabBarItem *previous = applyingItem;
@@ -92,6 +119,7 @@ static void RefreshRoot(UITabBarController *root) {
     }
     if (state.owner != root) return;
     WriteValue(item, ProjectedValue(state.nativeValue, correction));
+    WriteSkinned(item, correction);
     if (newlyBound) RUINRefreshLocalUnreadBadgeTotals();
 }
 
@@ -128,6 +156,30 @@ static void RefreshRoot(UITabBarController *root) {
 - (void)viewDidAppear:(BOOL)animated { %orig(animated); RefreshRoot(self); }
 %end
 %end
+
+%group RUINLocalUnreadSkinnedBadge
+%hook UITabBarItem
+- (void)setSkinnedBadgeValue:(id)value {
+    if (applyingItem == self) { %orig(value); return; }
+    objc_setAssociatedObject(self, &SkinnedNativeKey, value ?: NSNull.null, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    skinnedNativeSets++;
+    skinnedValueClass = value ? NSStringFromClass([value class]) : @"nil";
+    RUINLocalTabBadgeState *state = NSThread.isMainThread ? objc_getAssociatedObject(self, &StateKey) : nil;
+    UITabBarController *owner = state.owner;
+    if (!owner || TalkItem(owner) != self) { %orig(value); return; }
+    %orig(ProjectedSkinned(value, correction));
+    rawChanges++;
+    RUINRefreshLocalUnreadBadgeTotals();
+}
+%end
+%end
+
+__attribute__((constructor)) static void RUINInstallSkinnedBadgeEarly(void) {
+    Method method = class_getInstanceMethod(UITabBarItem.class, @selector(setSkinnedBadgeValue:));
+    if (!method || strcmp(method_getTypeEncoding(method), "v24@0:8@16") || !method_getImplementation(method)) return;
+    %init(RUINLocalUnreadSkinnedBadge);
+    skinnedHooked = YES;
+}
 
 // iOS 18 UITab API only; absent on iOS 15 (LINE 14.6.3 port).
 %group RUINLocalUnreadTabBadgeTabs
@@ -201,7 +253,9 @@ static NSArray *TabShapes(void) {
         NSUInteger depth = 0;
         while ([content isKindOfClass:UINavigationController.class] && depth++ < 8)
             content = ((UINavigationController *)content).viewControllers.firstObject;
-        [out addObject:@{@"content":content ? NSStringFromClass(content.class) : @"", @"badge":entry.tabBarItem.badgeValue ?: @""}];
+        id skinned = objc_getAssociatedObject(entry.tabBarItem, &SkinnedNativeKey);
+        [out addObject:@{@"content":content ? NSStringFromClass(content.class) : @"", @"badge":entry.tabBarItem.badgeValue ?: @"",
+            @"skinnedNative":skinned ? [skinned description] : @"-"}];
     }
     return out;
 }
@@ -209,5 +263,7 @@ NSDictionary *RUINLocalUnreadTabBadgeDiagnostics(void) {
     return @{@"installed":@(installed), @"correction":@(correction), @"bindings":@(bindings),
         @"rawChanges":@(rawChanges), @"displayWrites":@(correctionWrites),
         @"rootClass":rootClass ? NSStringFromClass(rootClass) : @"", @"chatClass":chatClass ? NSStringFromClass(chatClass) : @"",
-        @"liveRoots":@(roots.allObjects.count), @"tabs":TabShapes()};
+        @"liveRoots":@(roots.allObjects.count), @"tabs":TabShapes(),
+        @"skinnedHooked":@(skinnedHooked), @"skinnedNativeSets":@(skinnedNativeSets), @"skinnedWrites":@(skinnedWrites),
+        @"skinnedValueClass":skinnedValueClass ?: @""};
 }
