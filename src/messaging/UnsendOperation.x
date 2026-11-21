@@ -701,6 +701,8 @@ static NSArray *L14FilterFetch(NSFetchRequest *request, NSArray *actual) {
 }
 %end
 %end
+static void InitFetchGroup(void) { %init(RUINUnsendFetch); }
+static void InitDisplayGroup(Class cls) { %init(RUINUnsendDisplay, RUINUnsendDisplayedMessage = cls); }
 static void InstallLine14(void) {
     atomic_store(&line14Mode, YES);
     Class operation = objc_getClass("LineOperation");
@@ -709,12 +711,8 @@ static void InstallLine14(void) {
         l14Base = info.dli_fbase;
         l14Slide = (uintptr_t)info.dli_fbase - 0x100000000ULL;
     }
-    InstallOperationHook(NSManagedObjectContext.class, "executeFetchRequest:error:", "@32@0:8@16^@24", &fetchStatus, ^(__unused Class cls) {
-        %init(RUINUnsendFetch);
-    });
-    InstallOperationHook(objc_getClass("ManagedMessage"), "displayedText", "@16@0:8", &displayStatus, ^(Class cls) {
-        %init(RUINUnsendDisplay, RUINUnsendDisplayedMessage = cls);
-    });
+    InstallOperationHook(NSManagedObjectContext.class, "executeFetchRequest:error:", "@32@0:8@16^@24", &fetchStatus, ^(__unused Class cls) { InitFetchGroup(); });
+    InstallOperationHook(objc_getClass("ManagedMessage"), "displayedText", "@16@0:8", &displayStatus, ^(Class cls) { InitDisplayGroup(cls); });
     InstallOperationHook(operation, "read:", "v24@0:8@16", &l14ReadStatus, ^(Class cls) {
         %init(RUINUnsendL14Read, RUINUnsendL14Operation = cls);
     });
@@ -753,12 +751,8 @@ void RUINInstallUnsendOperation(void) {
             return;
         }
         RUIN_PROFILE_BEGIN("unsend.install_hooks");
-        InstallOperationHook(NSManagedObjectContext.class, "executeFetchRequest:error:", "@32@0:8@16^@24", &fetchStatus, ^(__unused Class cls) {
-            %init(RUINUnsendFetch);
-        });
-        InstallOperationHook(objc_getClass("ManagedMessage"), "displayedText", "@16@0:8", &displayStatus, ^(Class cls) {
-            %init(RUINUnsendDisplay, RUINUnsendDisplayedMessage = cls);
-        });
+        InstallOperationHook(NSManagedObjectContext.class, "executeFetchRequest:error:", "@32@0:8@16^@24", &fetchStatus, ^(__unused Class cls) { InitFetchGroup(); });
+        InstallOperationHook(objc_getClass("ManagedMessage"), "displayedText", "@16@0:8", &displayStatus, ^(Class cls) { InitDisplayGroup(cls); });
         InstallOperationHook(objc_getClass("LineOperation"), "param1", "@16@0:8", &param1Status, ^(Class cls) {
             %init(RUINUnsendParam1, RUINUnsendParsedOperation = cls);
         });
