@@ -361,9 +361,18 @@ static void UnbindButtonRecord(UIButton *button, RUINBadgeDisplay *record) {
     }
 }
 
+static NSDictionary *lastButtonState;
+static void NoteButtonState(UIButton *button, NSInteger target) {
+    if (!button) return;
+    lastButtonState = @{@"class":NSStringFromClass(button.class), @"superview":NSStringFromClass(button.superview.class ?: NSNull.class),
+        @"hidden":@(button.hidden), @"alpha":@(button.alpha), @"size":NSStringFromCGSize(button.bounds.size),
+        @"inWindow":@(button.window != nil), @"target":@(target),
+        @"title":[button titleForState:UIControlStateNormal] ?: @"", @"currentTitle":button.currentTitle ?: @""};
+}
 static void ApplyButtonState(RUINBadgeDisplay *record) {
     UIButton *button = record.button;
     if (!button || !record.overridden) return;
+    dispatch_async(dispatch_get_main_queue(), ^{ NoteButtonState(button, record.targetCount); });
     BOOL wasApplying = applyingButtonState;
     applyingButtonState = YES;
     if (record.targetCount == 0) {
@@ -736,6 +745,7 @@ NSDictionary *RUINLocalUnreadBadgesDiagnostics(void) {
         @"trackedCells":@(cells.count),
         @"countPolicy":BadgeCountDiagnostics(),
         @"tab":RUINLocalUnreadTabBadgeDiagnostics(),
+        @"lastButton":lastButtonState ?: @{},
         @"scope":@"chat_list_and_talk_tab_display_only", @"nativeDataWritten":@NO, @"readReceiptsSent":@NO};
 }
 #endif

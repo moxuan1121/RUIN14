@@ -124,10 +124,16 @@ static void RefreshRoot(UITabBarController *root) {
 %hook RUINUnreadNativeRoot
 - (void)setViewControllers:(NSArray *)controllers { %orig(controllers); RefreshRoot(self); }
 - (void)setViewControllers:(NSArray *)controllers animated:(BOOL)animated { %orig(controllers, animated); RefreshRoot(self); }
-- (void)setTabs:(NSArray *)tabs { %orig(tabs); RefreshRoot(self); }
-- (void)setTabs:(NSArray *)tabs animated:(BOOL)animated { %orig(tabs, animated); RefreshRoot(self); }
 - (void)viewDidLoad { %orig; RefreshRoot(self); }
 - (void)viewDidAppear:(BOOL)animated { %orig(animated); RefreshRoot(self); }
+%end
+%end
+
+// iOS 18 UITab API only; absent on iOS 15 (LINE 14.6.3 port).
+%group RUINLocalUnreadTabBadgeTabs
+%hook RUINUnreadNativeTabsRoot
+- (void)setTabs:(NSArray *)tabs { %orig(tabs); RefreshRoot(self); }
+- (void)setTabs:(NSArray *)tabs animated:(BOOL)animated { %orig(tabs, animated); RefreshRoot(self); }
 %end
 %end
 
@@ -144,12 +150,21 @@ static void DiscoverRoots(UIViewController *controller, NSHashTable *seen) {
 void RUINInstallLocalUnreadTabBadge(void) {
     if (!NSThread.isMainThread || installed || !RUINTargetMetadataMatchesInfo(NSBundle.mainBundle.infoDictionary)) return;
     Class root = NSClassFromString(@"_TtC22LineSharedUIComponents20RootTabBarController");
+    if (!root) root = NSClassFromString(@"_TtC20LineUtilUIComponents20RootTabBarController"); // LINE 14.6.3
     Class chat = NSClassFromString(@"_TtC13LineChatTabUI25ChatTabPageViewController");
+    if (!chat) chat = NSClassFromString(@"_TtC13LineChatTabUI21ChatTabViewController"); // LINE 14.6.3
     if (![root isSubclassOfClass:UITabBarController.class] || ![chat isSubclassOfClass:UIViewController.class] ||
         !ClassBelongs(root) || !ClassBelongs(chat)) return;
     const SEL selectors[] = {@selector(setViewControllers:), @selector(setViewControllers:animated:),
-        @selector(setTabs:), @selector(setTabs:animated:), @selector(viewDidLoad), @selector(viewDidAppear:)};
-    const char *types[] = {"v24@0:8@16", "v28@0:8@16B24", "v24@0:8@16", "v28@0:8@16B24", "v16@0:8", "v20@0:8B16"};
+        @selector(viewDidLoad), @selector(viewDidAppear:)};
+    const char *types[] = {"v24@0:8@16", "v28@0:8@16B24", "v16@0:8", "v20@0:8B16"};
+    const SEL tabSelectors[] = {@selector(setTabs:), @selector(setTabs:animated:)};
+    const char *tabTypes[] = {"v24@0:8@16", "v28@0:8@16B24"};
+    BOOL hasTabs = YES;
+    for (NSUInteger i = 0; i < 2; i++) {
+        Method method = class_getInstanceMethod(root, tabSelectors[i]);
+        if (!method || strcmp(method_getTypeEncoding(method), tabTypes[i]) || !method_getImplementation(method)) hasTabs = NO;
+    }
     Method badge = class_getInstanceMethod(UITabBarItem.class, @selector(setBadgeValue:));
     if (!badge || strcmp(method_getTypeEncoding(badge), "v24@0:8@16") || !method_getImplementation(badge)) return;
     Method item = class_getInstanceMethod(UIViewController.class, @selector(setTabBarItem:));
@@ -161,6 +176,7 @@ void RUINInstallLocalUnreadTabBadge(void) {
     rootClass = root; chatClass = chat;
     roots = [NSHashTable weakObjectsHashTable];
     %init(RUINLocalUnreadTabBadgeHooks, RUINUnreadNativeRoot = root);
+    if (hasTabs) { %init(RUINLocalUnreadTabBadgeTabs, RUINUnreadNativeTabsRoot = root); }
     installed = YES;
     NSHashTable *seen = [NSHashTable hashTableWithOptions:NSPointerFunctionsObjectPointerPersonality];
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
@@ -178,5 +194,7 @@ void RUINSetLocalUnreadTabBadgeCorrection(NSUInteger count) {
 
 NSDictionary *RUINLocalUnreadTabBadgeDiagnostics(void) {
     return @{@"installed":@(installed), @"correction":@(correction), @"bindings":@(bindings),
-        @"rawChanges":@(rawChanges), @"displayWrites":@(correctionWrites)};
+        @"rawChanges":@(rawChanges), @"displayWrites":@(correctionWrites),
+        @"rootClass":rootClass ? NSStringFromClass(rootClass) : @"", @"chatClass":chatClass ? NSStringFromClass(chatClass) : @"",
+        @"liveRoots":@(roots.allObjects.count)};
 }
