@@ -17,6 +17,8 @@
 #import <os/lock.h>
 #import <mach-o/dyld.h>
 #import <execinfo.h>
+#import <dlfcn.h>
+#import <pthread.h>
 #import <sqlite3.h>
 #import <stdatomic.h>
 #import <limits.h>
@@ -65,8 +67,10 @@ static _Thread_local uintptr_t testParam1Caller;
 static BOOL TargetMatches(void) {
     return RUINTargetMetadataMatchesInfo(NSBundle.mainBundle.infoDictionary);
 }
+static atomic_bool line14Mode;
+static NSArray *L14FilterFetch(NSFetchRequest *request, NSArray *actual);
 static BOOL Enabled(void) {
-    return atomic_load(&codeVerified) && TargetMatches() &&
+    return (atomic_load(&codeVerified) || atomic_load(&line14Mode)) && TargetMatches() &&
         [NSUserDefaults.standardUserDefaults boolForKey:RUINKeepUnsentMessagesKey];
 }
 static BOOL VerifyCode(void) {
@@ -397,6 +401,7 @@ static BOOL RetainedMarker(NSDictionary *key, BOOL write) {
     @try {
         atomic_fetch_add(&fetchCalls, 1);
         NSArray *actual = %orig;
+        if (atomic_load(&line14Mode)) return fetchDepth == 1 ? L14FilterFetch(request, actual) : actual;
         if (fetchDepth != 1 || !Enabled() || actual.count != 1) return actual;
         @try {
             NSString *requested = RequestedMessage(request);
@@ -476,6 +481,262 @@ static void InstallOperationHook(Class cls, const char *name, const char *encodi
     initialize(cls);
     atomic_store(status, OperationHookInstalled);
 }
+// ---- LINE 14.6.3 port: unsend retention without address anchors ----
+// 14.6.3 has no verified address mapping. The incoming destroy operation
+// (type 65, param2 = message ID) is recorded when its Thrift struct finishes
+// decoding; for a short window, only fetches that explicitly constrain
+// `id` to that message, and deleteObject: of that exact message, are
+// intercepted. Everything else (and type 64, own unsend) stays native.
+static os_unfair_lock l14Lock = OS_UNFAIR_LOCK_INIT;
+static NSMutableDictionary<NSString *, NSDictionary *> *l14Pending;
+static NSMutableArray<NSDictionary *> *l14Events;
+static atomic_uint_fast64_t l14PendingCount, l14Ops, l14OwnOps, l14RejectedOps, l14Protected, l14DeleteSkips, l14BatchDeletes, l14Errors;
+static atomic_int l14ReadStatus, l14DeleteStatus, l14BatchStatus;
+static const void *l14Base;
+static uintptr_t l14Slide;
+static const double L14PendingSeconds = 120;
+
+static BOOL L14Eligible(void) {
+    NSString *version = NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"];
+    return [version isKindOfClass:NSString.class] && [version hasPrefix:@"14."] && TargetMatches();
+}
+static NSString *L14Thread(void) {
+    return [NSString stringWithFormat:@"%u%@", (unsigned)pthread_mach_thread_np(pthread_self()), NSThread.isMainThread ? @"m" : @""];
+}
+static NSArray<NSString *> *L14Frames(void) {
+    void *frames[28];
+    int count = backtrace(frames, 28);
+    NSMutableArray *out = [NSMutableArray array];
+    for (int i = 2; i < count; i++) {
+        Dl_info info;
+        if (!dladdr(frames[i], &info) || !info.dli_fbase) { [out addObject:@"?"]; continue; }
+        if (info.dli_fbase == l14Base) {
+            [out addObject:[NSString stringWithFormat:@"0x%lx", (unsigned long)((uintptr_t)frames[i] - l14Slide)]];
+        } else {
+            const char *name = info.dli_fname ? (strrchr(info.dli_fname, '/') ? strrchr(info.dli_fname, '/') + 1 : info.dli_fname) : "?";
+            [out addObject:[NSString stringWithFormat:@"%s+0x%lx", name, (unsigned long)((uintptr_t)frames[i] - (uintptr_t)info.dli_fbase)]];
+        }
+    }
+    return out;
+}
+static NSString *L14Redact(NSString *text, NSString *message) {
+    if (![text isKindOfClass:NSString.class]) return @"";
+    if (message.length) text = [text stringByReplacingOccurrencesOfString:message withString:@"<ID>"];
+    static NSRegularExpression *tokens;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ tokens = [NSRegularExpression regularExpressionWithPattern:@"[A-Za-z0-9]{12,}" options:0 error:NULL]; });
+    text = [tokens stringByReplacingMatchesInString:text options:0 range:NSMakeRange(0, text.length) withTemplate:@"<X>"];
+    return text.length > 300 ? [text substringToIndex:300] : text;
+}
+static void L14Event(NSDictionary *event) {
+    os_unfair_lock_lock(&l14Lock);
+    if (!l14Events) l14Events = [NSMutableArray array];
+    if (l14Events.count < 30) [l14Events addObject:event];
+    os_unfair_lock_unlock(&l14Lock);
+}
+static NSDictionary *L14PendingFor(NSString *message) {
+    if (!message) return nil;
+    os_unfair_lock_lock(&l14Lock);
+    NSDictionary *entry = l14Pending[message];
+    if (entry && CFAbsoluteTimeGetCurrent() - [entry[@"time"] doubleValue] > L14PendingSeconds) {
+        [l14Pending removeObjectForKey:message];
+        atomic_store(&l14PendingCount, l14Pending.count);
+        entry = nil;
+    }
+    os_unfair_lock_unlock(&l14Lock);
+    return entry;
+}
+static NSArray<NSString *> *L14PendingIDs(void) {
+    os_unfair_lock_lock(&l14Lock);
+    NSArray *ids = l14Pending.allKeys ?: @[];
+    os_unfair_lock_unlock(&l14Lock);
+    return ids;
+}
+static void L14AddPending(NSString *message, NSString *chat, NSString *thread) {
+    os_unfair_lock_lock(&l14Lock);
+    if (!l14Pending) l14Pending = [NSMutableDictionary dictionary];
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    for (NSString *old in l14Pending.allKeys)
+        if (now - [l14Pending[old][@"time"] doubleValue] > L14PendingSeconds) [l14Pending removeObjectForKey:old];
+    if (l14Pending.count < 256) l14Pending[message] = @{@"chat":chat ?: @"", @"time":@(now), @"thread":thread ?: @""};
+    atomic_store(&l14PendingCount, l14Pending.count);
+    os_unfair_lock_unlock(&l14Lock);
+}
+static NSString *L14MessageID(id value) {
+    if ([value isKindOfClass:NSNumber.class]) value = [value stringValue];
+    return MessageID(value);
+}
+static void L14CollectIDs(NSPredicate *predicate, NSMutableSet<NSString *> *ids) {
+    if ([predicate isKindOfClass:NSCompoundPredicate.class]) {
+        NSCompoundPredicate *compound = (NSCompoundPredicate *)predicate;
+        if (compound.compoundPredicateType != NSAndPredicateType) return;
+        for (NSPredicate *sub in compound.subpredicates) L14CollectIDs(sub, ids);
+        return;
+    }
+    if (![predicate isKindOfClass:NSComparisonPredicate.class]) return;
+    NSComparisonPredicate *p = (NSComparisonPredicate *)predicate;
+    if (p.comparisonPredicateModifier != NSDirectPredicateModifier) return;
+    NSExpression *left = p.leftExpression, *right = p.rightExpression;
+    if (left.expressionType == NSConstantValueExpressionType) { NSExpression *swap = left; left = right; right = swap; }
+    if (left.expressionType != NSKeyPathExpressionType || right.expressionType != NSConstantValueExpressionType ||
+        ![left.keyPath isEqual:@"id"]) return;
+    id constant = right.constantValue;
+    if (p.predicateOperatorType == NSEqualToPredicateOperatorType) {
+        NSString *message = L14MessageID(constant);
+        if (message) [ids addObject:message];
+    } else if (p.predicateOperatorType == NSInPredicateOperatorType &&
+               ([constant isKindOfClass:NSArray.class] || [constant isKindOfClass:NSSet.class])) {
+        for (id value in constant) { NSString *message = L14MessageID(value); if (message) [ids addObject:message]; }
+    }
+}
+static BOOL L14Protect(NSManagedObject *object, NSDictionary *key, NSDictionary *pending, NSString *how) {
+    BOOL marker = RetainedMarker(key, YES);
+    if (!marker) atomic_fetch_add(&markerFailures, 1);
+#if TARGET_OS_IPHONE
+    @try { RUINCaptureRetainedMedia(object, key); } @catch (__unused NSException *exception) { atomic_fetch_add(&l14Errors, 1); }
+#endif
+    @try {
+        RUINInstallMessageHistory();
+        NSDictionary *snapshot = RUINHistoryRetainUnsentSnapshotForKey(key);
+        if (snapshot.count && ![snapshot[@"originalUnavailable"] boolValue]) atomic_fetch_add(&historyFreezes, 1);
+    } @catch (__unused NSException *exception) { atomic_fetch_add(&l14Errors, 1); }
+    NSString *thread = L14Thread();
+    L14Event(@{@"ev":how, @"thread":thread, @"sameThreadAsOp":@([pending[@"thread"] isEqual:thread]),
+        @"chatMatches":@([pending[@"chat"] isEqual:key[@"chat"]]), @"marker":@(marker), @"frames":L14Frames()});
+    return marker;
+}
+static NSArray *L14FilterFetch(NSFetchRequest *request, NSArray *actual) {
+    if (!atomic_load(&l14PendingCount) || !actual.count || !Enabled()) return actual;
+    @try {
+        if (request.resultType != NSManagedObjectResultType) return actual;
+        NSMutableSet<NSString *> *ids = [NSMutableSet set];
+        L14CollectIDs(request.predicate, ids);
+        if (!ids.count) {
+            NSString *format = request.predicate.predicateFormat;
+            for (NSString *message in L14PendingIDs()) if ([format containsString:message]) {
+                L14Event(@{@"ev":@"fetchNotParsed", @"entity":request.entityName ?: @"", @"pred":L14Redact(format, message),
+                    @"count":@(actual.count), @"thread":L14Thread(), @"frames":L14Frames()});
+                break;
+            }
+            return actual;
+        }
+        Class messageClass = objc_getClass("ManagedMessage");
+        NSMutableIndexSet *remove = nil;
+        for (NSUInteger i = 0; i < actual.count; i++) {
+            id object = actual[i];
+            if (!messageClass || ![object isKindOfClass:messageClass] || ((NSManagedObject *)object).isDeleted) continue;
+            NSDictionary *key = RUINHistoryMessageKey(object);
+            NSString *message = key[@"message"];
+            NSDictionary *pending = [ids containsObject:message ?: @""] ? L14PendingFor(message) : nil;
+            if (!pending) continue;
+            L14Protect(object, key, pending, @"fetchEmptied");
+            atomic_fetch_add(&l14Protected, 1);
+            if (!remove) remove = [NSMutableIndexSet indexSet];
+            [remove addIndex:i];
+        }
+        if (!remove.count) return actual;
+        NSMutableArray *kept = [actual mutableCopy];
+        [kept removeObjectsAtIndexes:remove];
+        return [kept copy];
+    } @catch (__unused NSException *exception) { atomic_fetch_add(&l14Errors, 1); }
+    return actual;
+}
+%group RUINUnsendL14Read
+%hook RUINUnsendL14Operation
+- (void)read:(id)protocol {
+    %orig;
+    @try {
+        id<RUINMessagingOperationFields> operation = (id)self;
+        long long type = [operation type];
+        if (type != 64 && type != 65) return;
+        if (!Enabled()) return;
+        atomic_fetch_add(&l14Ops, 1);
+        if (type == 64) { atomic_fetch_add(&l14OwnOps, 1); return; }
+        NSString *message = L14MessageID([operation param2]);
+        id chat = [operation param1];
+        id silent = [operation param3];
+        if (!message) { atomic_fetch_add(&l14RejectedOps, 1); return; }
+        NSString *thread = L14Thread();
+        L14AddPending(message, [chat isKindOfClass:NSString.class] ? [chat copy] : @"", thread);
+        L14Event(@{@"ev":@"op65", @"thread":thread,
+            @"chatKind":[chat isKindOfClass:NSString.class] && [chat length] ? [chat substringToIndex:1] : @"-",
+            @"param3":[silent isKindOfClass:NSString.class] && [silent length] <= 4 ? silent : NSStringFromClass([silent class] ?: NSNull.class)});
+    } @catch (__unused NSException *exception) { atomic_fetch_add(&l14Errors, 1); }
+}
+%end
+%end
+%group RUINUnsendL14Delete
+%hook NSManagedObjectContext
+- (void)deleteObject:(NSManagedObject *)object {
+    if (atomic_load(&l14PendingCount) && Enabled()) {
+        @try {
+            Class messageClass = objc_getClass("ManagedMessage");
+            if (messageClass && [object isKindOfClass:messageClass]) {
+                NSDictionary *key = RUINHistoryMessageKey(object);
+                NSDictionary *pending = L14PendingFor(key[@"message"]);
+                if (pending) {
+                    L14Protect(object, key, pending, @"deleteSkipped");
+                    atomic_fetch_add(&l14DeleteSkips, 1);
+                    return;
+                }
+            }
+        } @catch (__unused NSException *exception) { atomic_fetch_add(&l14Errors, 1); }
+    }
+    %orig;
+}
+%end
+%end
+%group RUINUnsendL14Batch
+%hook NSManagedObjectContext
+- (id)executeRequest:(NSPersistentStoreRequest *)request error:(NSError **)error {
+    if (atomic_load(&l14PendingCount) && [request isKindOfClass:NSBatchDeleteRequest.class]) {
+        @try {
+            NSFetchRequest *fetch = ((NSBatchDeleteRequest *)request).fetchRequest;
+            atomic_fetch_add(&l14BatchDeletes, 1);
+            L14Event(@{@"ev":@"batchDelete", @"entity":fetch.entityName ?: @"", @"pred":L14Redact(fetch.predicate.predicateFormat, nil),
+                @"thread":L14Thread(), @"frames":L14Frames()});
+        } @catch (__unused NSException *exception) { atomic_fetch_add(&l14Errors, 1); }
+    }
+    return %orig;
+}
+%end
+%end
+static void InstallLine14(void) {
+    atomic_store(&line14Mode, YES);
+    Class operation = objc_getClass("LineOperation");
+    Dl_info info;
+    if (operation && dladdr((__bridge const void *)operation, &info) && info.dli_fbase) {
+        l14Base = info.dli_fbase;
+        l14Slide = (uintptr_t)info.dli_fbase - 0x100000000ULL;
+    }
+    InstallOperationHook(NSManagedObjectContext.class, "executeFetchRequest:error:", "@32@0:8@16^@24", &fetchStatus, ^(__unused Class cls) {
+        %init(RUINUnsendFetch);
+    });
+    InstallOperationHook(objc_getClass("ManagedMessage"), "displayedText", "@16@0:8", &displayStatus, ^(Class cls) {
+        %init(RUINUnsendDisplay, RUINUnsendDisplayedMessage = cls);
+    });
+    InstallOperationHook(operation, "read:", "v24@0:8@16", &l14ReadStatus, ^(Class cls) {
+        %init(RUINUnsendL14Read, RUINUnsendL14Operation = cls);
+    });
+    InstallOperationHook(NSManagedObjectContext.class, "deleteObject:", "v24@0:8@16", &l14DeleteStatus, ^(__unused Class cls) {
+        %init(RUINUnsendL14Delete);
+    });
+    InstallOperationHook(NSManagedObjectContext.class, "executeRequest:error:", "@32@0:8@16^@24", &l14BatchStatus, ^(__unused Class cls) {
+        %init(RUINUnsendL14Batch);
+    });
+}
+static NSDictionary *L14Diagnostics(void) {
+    NSArray *statuses = @[@"pending", @"gated", @"missing_or_encoding_mismatch", @"installed"];
+    os_unfair_lock_lock(&l14Lock);
+    NSArray *events = [l14Events copy] ?: @[];
+    os_unfair_lock_unlock(&l14Lock);
+    return @{@"mode":@(atomic_load(&line14Mode)), @"readHook":statuses[atomic_load(&l14ReadStatus)],
+        @"deleteHook":statuses[atomic_load(&l14DeleteStatus)], @"batchHook":statuses[atomic_load(&l14BatchStatus)],
+        @"destroyOps":@(atomic_load(&l14Ops)), @"ownDestroyOps":@(atomic_load(&l14OwnOps)), @"rejectedOps":@(atomic_load(&l14RejectedOps)),
+        @"pending":@(atomic_load(&l14PendingCount)), @"fetchProtected":@(atomic_load(&l14Protected)),
+        @"deleteSkips":@(atomic_load(&l14DeleteSkips)), @"batchDeletes":@(atomic_load(&l14BatchDeletes)),
+        @"errors":@(atomic_load(&l14Errors)), @"events":events};
+}
 void RUINInstallUnsendOperation(void) {
     os_unfair_lock_lock(&installLock);
     @try {
@@ -488,6 +749,7 @@ void RUINInstallUnsendOperation(void) {
             if (atomic_load(&displayStatus) != OperationHookInstalled) atomic_store(&displayStatus, OperationHookGated);
             if (atomic_load(&param1Status) != OperationHookInstalled) atomic_store(&param1Status, OperationHookGated);
             RUIN_PROFILE_INSTANT("unsend.hooks_gated", RUINProfileStatusSkipped);
+            if (L14Eligible()) InstallLine14();
             return;
         }
         RUIN_PROFILE_BEGIN("unsend.install_hooks");
@@ -566,6 +828,7 @@ NSDictionary *RUINUnsendOperationDiagnostics(void) {
         @"fetchCalls":@(atomic_load(&fetchCalls)), @"scopedLookups":@(atomic_load(&scopedLookups)),
         @"protectedMessages":@(atomic_load(&protectedMessages)), @"rejectedLookups":@(atomic_load(&rejectedLookups)),
         @"markerFailures":@(atomic_load(&markerFailures)), @"historyFreezes":@(atomic_load(&historyFreezes)),
+        @"line14":L14Diagnostics(),
         @"displayReplacementReturns":@(atomic_load(&displayReturns)), @"inspectionErrors":@(atomic_load(&observationErrors)), @"markerCount":@(count),
         @"operationMapping":@"current parser: 64 sender / 65 others; param1 chat, param2 positive message ID, param3 exactly 1 silent",
         @"boundary":@"original fetch once; verified ordered server destroy-operation lookup for types 64/65 alone receives empty result before local cleanup/delete/tombstone",
