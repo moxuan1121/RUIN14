@@ -38,7 +38,7 @@ APPLE_DEPENDENCIES = {
 } | {
     f"{prefix}libswift{name}.dylib"
     for prefix in ("/usr/lib/swift/", "@rpath/")
-    for name in ("Core", "CoreFoundation", "Dispatch", "ObjectiveC", "XPC",
+    for name in ("Core", "CoreFoundation", "Dispatch", "ObjectiveC", "XPC", "Darwin", "Foundation",
                  "_Builtin_float", "_Concurrency")
 }
 VERSION_RE = re.compile(
