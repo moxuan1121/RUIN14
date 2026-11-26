@@ -5,7 +5,6 @@
 #import "TargetMetadata.h"
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
-#import <objc/message.h>
 #include <string.h>
 
 @interface RUINLocalTabBadgeState : NSObject
@@ -58,6 +57,9 @@ static UITabBarItem *TalkItem(UITabBarController *root) {
 // ---- LINE 14.6.3: the Talk badge is drawn by LINE.SkinnedTabBarItem and set
 // through the category setter -[UITabBarItem setSkinnedBadgeValue:]; the
 // system badgeValue stays nil. The last native value is recorded from launch.
+@interface UITabBarItem (RUINLINE14Skinned)
+- (void)setSkinnedBadgeValue:(id)value; // LINE 14.6.3 category, checked at runtime before use
+@end
 static char SkinnedNativeKey;
 static BOOL skinnedHooked;
 static NSUInteger skinnedNativeSets, skinnedWrites;
@@ -78,7 +80,7 @@ static void WriteSkinned(UITabBarItem *item, NSUInteger count) {
     id native = stored == NSNull.null ? nil : stored;
     UITabBarItem *previous = applyingItem;
     applyingItem = item;
-    @try { ((void (*)(id, SEL, id))objc_msgSend)(item, @selector(setSkinnedBadgeValue:), ProjectedSkinned(native, count)); skinnedWrites++; }
+    @try { [item setSkinnedBadgeValue:ProjectedSkinned(native, count)]; skinnedWrites++; }
     @finally { applyingItem = previous; }
 }
 static void WriteValue(UITabBarItem *item, NSString *value) {
