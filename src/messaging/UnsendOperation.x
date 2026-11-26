@@ -590,6 +590,7 @@ static void L14CollectIDs(NSPredicate *predicate, NSMutableSet<NSString *> *ids)
     }
 }
 static BOOL L14Protect(NSManagedObject *object, NSDictionary *key, NSDictionary *pending, NSString *how) {
+    (void)object;
     BOOL marker = RetainedMarker(key, YES);
     if (!marker) atomic_fetch_add(&markerFailures, 1);
 #if TARGET_OS_IPHONE
