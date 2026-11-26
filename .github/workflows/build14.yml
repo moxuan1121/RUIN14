@@ -4,38 +4,142 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    tags: ['v*']
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     runs-on: macos-15
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Select and validate version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            [[ "$GITHUB_REF_NAME" == v* ]] || { echo "Release tags must start with v." >&2; exit 1; }
+            ruin_version="${GITHUB_REF_NAME#v}"
+          else
+            ruin_version="$(tr -d '[:space:]' < VERSION)"
+          fi
+          python3 -c 'import sys; sys.path.insert(0, "tools"); from distribute import validate_version; validate_version(sys.argv[1])' "$ruin_version"
+          echo "value=$ruin_version" >> "$GITHUB_OUTPUT"
+          echo "RUIN_BUILD_VERSION=$ruin_version" >> "$GITHUB_ENV"
 
       - name: Build arm64+arm64e dylib (iOS 15 target)
         run: |
           set -o pipefail
-          make -k -j4 all RUIN_BUILD_VERSION="$(tr -d '[:space:]' < VERSION)" 2>&1 | tee build.log
+          make -j4 all RUIN_BUILD_VERSION="$RUIN_BUILD_VERSION" 2>&1 | tee build.log
 
       - name: Show availability / compile errors
         if: failure()
         run: grep -nE 'error:|is only available on iOS' build.log | head -200 || true
 
       - name: Verify dylib
+        shell: bash
         run: |
           set -euo pipefail
           lipo build/RUIN.dylib -archs
+          lipo build/RUIN.dylib -verify_arch arm64 arm64e
           otool -l build/RUIN.dylib | grep -A3 -E 'LC_BUILD_VERSION|LC_VERSION_MIN' | head -20
           otool -L build/RUIN.dylib
           ! otool -L build/RUIN.dylib | grep -Ei 'substrate|ellekit|libhooker'
-          cp build/RUIN.dylib RUIN.dylib
+          cp build/RUIN.dylib "RUIN-${RUIN_BUILD_VERSION}.dylib"
 
-      - name: Upload dylib to draft release
+      - name: Verify theme download feature is compiled in
+        shell: bash
+        run: |
+          set -euo pipefail
+          for token in LineShopProductDetail isAvailableForMyself priceInLineCoin customDownloadButtonLabel enableThemeDL; do
+            strings -a build/RUIN.dylib | grep -qF "$token" || { echo "missing theme download token: $token" >&2; exit 1; }
+            echo "ok: $token"
+          done
+
+      - name: Run host fixtures
+        run: make -j4 check-host
+
+      - name: Verify packaging and embedded resources
+        run: make check-packaging
+
+      - name: Package deb variants and LiveContainer dylib
+        run: make dist RUIN_BUILD_VERSION="$RUIN_BUILD_VERSION"
+
+      - name: Verify distribution artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -l dist
+          for variant in rootful rootless jailed; do
+            test -s "dist/RUIN-${RUIN_BUILD_VERSION}-${variant}.deb"
+            echo "ok: RUIN-${RUIN_BUILD_VERSION}-${variant}.deb"
+          done
+          test -s "dist/RUIN-${RUIN_BUILD_VERSION}-LiveContainer.dylib"
+          python3 -c 'import sys; sys.path.insert(0, "tools"); from distribute import verify_dylib; verify_dylib(sys.argv[1], for_livecontainer=True)' "dist/RUIN-${RUIN_BUILD_VERSION}-LiveContainer.dylib"
+          python3 tools/verify_embedded_resources.py "dist/RUIN-${RUIN_BUILD_VERSION}-LiveContainer.dylib"
+          (cd dist && shasum -a 256 -c SHA256SUMS)
+
+      - name: Upload rootful artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruin-${{ steps.version.outputs.value }}-rootful
+          path: dist/RUIN-${{ steps.version.outputs.value }}-rootful.deb
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload rootless artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruin-${{ steps.version.outputs.value }}-rootless
+          path: dist/RUIN-${{ steps.version.outputs.value }}-rootless.deb
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload jailed artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruin-${{ steps.version.outputs.value }}-jailed
+          path: dist/RUIN-${{ steps.version.outputs.value }}-jailed.deb
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload LiveContainer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruin-${{ steps.version.outputs.value }}-LiveContainer
+          path: dist/RUIN-${{ steps.version.outputs.value }}-LiveContainer.dylib
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload standalone dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruin-${{ steps.version.outputs.value }}-dylib
+          path: RUIN-${{ steps.version.outputs.value }}.dylib
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="v$(tr -d '[:space:]' < VERSION)"
-          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --draft --title "$tag" --notes "LINE 14.6.3 port build ${GITHUB_SHA::7}"
-          gh release upload "$tag" RUIN.dylib --clobber
+          set -euo pipefail
+          release_files=(
+            "dist/RUIN-${RUIN_BUILD_VERSION}-rootful.deb"
+            "dist/RUIN-${RUIN_BUILD_VERSION}-rootless.deb"
+            "dist/RUIN-${RUIN_BUILD_VERSION}-jailed.deb"
+            "dist/RUIN-${RUIN_BUILD_VERSION}-LiveContainer.dylib"
+            dist/SHA256SUMS
+          )
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${release_files[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${release_files[@]}" \
+              --verify-tag --title "RUIN $GITHUB_REF_NAME" --generate-notes
+          fi
