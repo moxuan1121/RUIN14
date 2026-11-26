@@ -56,8 +56,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          strings -a build/RUIN.dylib > dylib-strings.txt
           for token in LineShopProductDetail isAvailableForMyself priceInLineCoin customDownloadButtonLabel enableThemeDL; do
-            strings -a build/RUIN.dylib | grep -qF "$token" || { echo "missing theme download token: $token" >&2; exit 1; }
+            grep -qF "$token" dylib-strings.txt || { echo "missing theme download token: $token" >&2; exit 1; }
             echo "ok: $token"
           done
 
