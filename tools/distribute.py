@@ -34,6 +34,7 @@ APPLE_DEPENDENCIES = {
 } | {
     "/usr/lib/libsqlite3.dylib", "/usr/lib/libz.1.dylib",
     "/usr/lib/libSystem.B.dylib", "/usr/lib/libobjc.A.dylib",
+    "/usr/lib/libc++.1.dylib",  # linked when deploying to iOS 15 (LINE 14.6.3 port)
 } | {
     f"{prefix}libswift{name}.dylib"
     for prefix in ("/usr/lib/swift/", "@rpath/")
